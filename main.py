@@ -915,7 +915,7 @@ class AetherStreamingApp(ctk.CTk):
             hover_color="#D9B87A",
             text_color="#0D0F12",
             font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
-            padx=22,
+            width=176,
             command=self._start_or_toggle_wave,
         )
         self.wave_main_btn.pack(side="left", padx=(0, 8))
@@ -956,7 +956,7 @@ class AetherStreamingApp(ctk.CTk):
                 border_width=1 if active else 0,
                 border_color=self.accent_color,
                 font=ctk.CTkFont(size=12, weight="bold" if active else "normal"),
-                padx=14,
+                width=76,
                 command=lambda val=m: self._set_wave_mood(val),
             ).pack(side="left", padx=4)
 
@@ -979,7 +979,7 @@ class AetherStreamingApp(ctk.CTk):
                 border_width=1 if active else 0,
                 border_color=self.accent_color,
                 font=ctk.CTkFont(size=12, weight="bold" if active else "normal"),
-                padx=14,
+                width=76,
                 command=lambda val=g: self._set_wave_genre(val),
             ).pack(side="left", padx=4)
 
