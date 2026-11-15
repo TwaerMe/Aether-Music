@@ -1,4 +1,5 @@
 import colorsys
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import os
@@ -44,15 +45,19 @@ APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".aether_player")
 STATE_FILE = os.path.join(APP_DATA_DIR, "user_state.json")
 DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Music", "Aether")
 
-# Общие опции yt-dlp для максимально быстрого поиска и извлечения аудио
+# Максимально быстрые опции yt-dlp:
+# ios/android клиенты отдают прямые ссылки без тяжелой расшифровки JS-плеера
 YDL_FAST_EXTRACT_OPTS = {
     "quiet": True,
     "no_warnings": True,
     "ignoreerrors": True,
     "nocheckcertificate": True,
+    "no_check_formats": True,
+    "format": "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/best",
+    "noplaylist": True,
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "ios", "web"],
+            "player_client": ["ios", "android"],
             "skip": ["hls", "dash", "translated_subs"],
         }
     },
@@ -98,6 +103,28 @@ def extract_video_id(url: str | None) -> str | None:
         return None
     m = re.search(r"(?:v=|youtu\.be/|/shorts/)([0-9A-Za-z_-]{11})", url)
     return m.group(1) if m else None
+
+
+def normalize_channel_input(raw: str) -> tuple[str, str]:
+    """Превращает @handle, ссылку на канал или плейлист в (display_name, url)."""
+    val = raw.strip()
+    if not val:
+        return "", ""
+
+    if "list=" in val:
+        m = re.search(r"list=([0-9A-Za-z_-]+)", val)
+        if m:
+            plist_id = m.group(1)
+            return f"Плейлист ({plist_id[:10]}…)", f"https://www.youtube.com/playlist?list={plist_id}"
+
+    if val.startswith("http://") or val.startswith("https://"):
+        clean_url = val.rstrip("/")
+        handle_m = re.search(r"youtube\.com/(@[^/?#]+)", clean_url)
+        label = handle_m.group(1) if handle_m else clean_url.split("/")[-1]
+        return label, clean_url
+
+    handle = val if val.startswith("@") else f"@{val}"
+    return handle, f"https://www.youtube.com/{handle}"
 
 
 def make_rounded_cover(img: Image.Image, size=(56, 56), radius=10) -> Image.Image:
@@ -315,9 +342,10 @@ class StreamAudioEngine:
 
     def _playback_worker(self, sid: int, source: str, start_sec: float):
         cmd = [self.ffmpeg_exe]
+        # Минимальный буфер для старта звука с первых миллисекунд
         cmd.extend([
-            "-analyzeduration", "400000",
-            "-probesize", "32768",
+            "-analyzeduration", "150000",
+            "-probesize", "16384",
             "-fflags", "+nobuffer",
             "-flags", "low_delay",
         ])
@@ -325,7 +353,7 @@ class StreamAudioEngine:
             cmd.extend([
                 "-reconnect", "1",
                 "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "3",
+                "-reconnect_delay_max", "2",
             ])
         if start_sec > 0.1:
             cmd.extend(["-ss", f"{start_sec:.2f}"])
@@ -355,18 +383,18 @@ class StreamAudioEngine:
             return
 
         finished_naturally = False
-        chunk_bytes = 4096
+        chunk_bytes = 2048
 
         try:
             with sd.RawOutputStream(
                 samplerate=self.sample_rate,
                 channels=2,
                 dtype="int16",
-                blocksize=1024,
+                blocksize=512,
             ) as stream:
                 while not self._stop_event.is_set() and sid == self._session_id:
                     if self.is_paused:
-                        time.sleep(0.04)
+                        time.sleep(0.03)
                         continue
 
                     raw = proc.stdout.read(chunk_bytes)
@@ -451,7 +479,7 @@ class AetherStreamingApp(ctk.CTk):
         super().__init__()
 
         self.title("Aether Music")
-        self.geometry("1140x710")
+        self.geometry("1150x720")
         self.minsize(960, 620)
         self.configure(fg_color=THEME["bg_root"])
 
@@ -459,8 +487,20 @@ class AetherStreamingApp(ctk.CTk):
             on_track_end_callback=lambda: self.after(0, self._on_track_finished)
         )
 
-        # Профиль вкуса и рекомендации
+        # Пул потоков для параллельной предзагрузки прямых аудиоссылок
+        self.prefetch_pool = ThreadPoolExecutor(max_workers=6)
+        self.thread_local = threading.local()
+
+        # Кэш поисковых запросов в RAM для мгновенных повторных поисков
+        self.search_cache: dict[str, list[TrackItem]] = {}
+
+        # Профиль вкуса, YouTube-канал и рекомендации
         self.liked_tracks: list[TrackItem] = []
+        self.channel_tracks: list[TrackItem] = []
+        self.channel_handle: str = ""
+        self.channel_url: str = ""
+        self.channel_syncing: bool = False
+
         self.disliked_uids: set[str] = set()
         self.session_played_uids: set[str] = set()
         self.artist_scores: dict[str, float] = {}
@@ -480,7 +520,7 @@ class AetherStreamingApp(ctk.CTk):
 
         # Настройки навигации и волны
         self.current_page = "wave"      # "wave" | "search" | "library"
-        self.library_subtab = "liked"   # "liked" | "local"
+        self.library_subtab = "liked"   # "liked" | "channel" | "local"
         self.wave_mood = "Любое"
         self.wave_fetching = False
 
@@ -510,11 +550,31 @@ class AetherStreamingApp(ctk.CTk):
         self._build_layout()
         self._bind_shortcuts()
         self._render_page()
-        self._prefill_wave_if_empty()
+
+        if self.channel_url:
+            self._sync_youtube_channel(refresh_wave_after=True)
+        else:
+            self._prefill_wave_if_empty()
+
         self._tick_loop()
 
     # ==========================================
-    # СОХРАНЕНИЕ ПРОФИЛЯ ВКУСА И СОСТОЯНИЯ
+    # ПЕРЕИСПОЛЬЗУЕМЫЕ ИНСТАНСЫ YT-DLP (БЕЗ ПОВТОРНОГО ПАРСИНГА JS)
+    # ==========================================
+    def _get_extract_ydl(self) -> yt_dlp.YoutubeDL:
+        ydl = getattr(self.thread_local, "extract_ydl", None)
+        if ydl is None:
+            ydl = yt_dlp.YoutubeDL(dict(YDL_FAST_EXTRACT_OPTS))
+            self.thread_local.extract_ydl = ydl
+        return ydl
+
+    def _get_search_ydl(self, playlist_end: int = 15) -> yt_dlp.YoutubeDL:
+        opts = dict(YDL_FAST_SEARCH_OPTS)
+        opts["playlistend"] = playlist_end
+        return yt_dlp.YoutubeDL(opts)
+
+    # ==========================================
+    # СОХРАНЕНИЕ ПРОФИЛЯ ВКУСА И КАНАЛА
     # ==========================================
     def _load_user_state(self):
         try:
@@ -524,15 +584,20 @@ class AetherStreamingApp(ctk.CTk):
                 self.liked_tracks = [
                     TrackItem.from_dict(item) for item in data.get("liked_tracks", [])
                 ]
+                self.channel_tracks = [
+                    TrackItem.from_dict(item) for item in data.get("channel_tracks", [])
+                ]
+                self.channel_handle = data.get("channel_handle", "")
+                self.channel_url = data.get("channel_url", "")
                 self.disliked_uids = set(data.get("disliked_uids", []))
                 self.artist_scores = {
                     str(k): float(v) for k, v in data.get("artist_scores", {}).items()
                 }
-                self.seed_videos = list(data.get("seed_videos", []))[-30:]
+                self.seed_videos = list(data.get("seed_videos", []))[-40:]
                 self.custom_seeds = list(data.get("custom_seeds", []))[:12]
 
-                if not self.seed_videos and self.liked_tracks:
-                    for t in self.liked_tracks[:15]:
+                if not self.seed_videos and (self.liked_tracks or self.channel_tracks):
+                    for t in (self.liked_tracks + self.channel_tracks)[:20]:
                         if t.video_id:
                             self.seed_videos.append({
                                 "vid": t.video_id,
@@ -548,9 +613,12 @@ class AetherStreamingApp(ctk.CTk):
             os.makedirs(APP_DATA_DIR, exist_ok=True)
             data = {
                 "liked_tracks": [t.to_dict() for t in self.liked_tracks],
+                "channel_tracks": [t.to_dict() for t in self.channel_tracks[:120]],
+                "channel_handle": self.channel_handle,
+                "channel_url": self.channel_url,
                 "disliked_uids": list(self.disliked_uids)[-400:],
                 "artist_scores": self.artist_scores,
-                "seed_videos": self.seed_videos[-30:],
+                "seed_videos": self.seed_videos[-40:],
                 "custom_seeds": self.custom_seeds[:12],
             }
             with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -563,11 +631,11 @@ class AetherStreamingApp(ctk.CTk):
         if not key or key.lower() in ("неизвестный исполнитель", "локальный файл", "youtube"):
             return
         cur = self.artist_scores.get(key, 0.0)
-        self.artist_scores[key] = max(-15.0, min(30.0, cur + delta))
+        self.artist_scores[key] = max(-15.0, min(35.0, cur + delta))
         if save:
             self._save_user_state()
 
-    def _record_positive_seed(self, track: TrackItem, weight: float = 2.0):
+    def _record_positive_seed(self, track: TrackItem, weight: float = 2.0, save: bool = True):
         self._adjust_artist_score(track.artist, weight, save=False)
         vid = track.video_id
         if vid:
@@ -577,11 +645,12 @@ class AetherStreamingApp(ctk.CTk):
                 "title": track.title,
                 "artist": track.artist,
             })
-            self.seed_videos = self.seed_videos[-30:]
-        self._save_user_state()
-        self._refresh_sidebar_taste_box()
+            self.seed_videos = self.seed_videos[-40:]
+        if save:
+            self._save_user_state()
+            self._refresh_sidebar_taste_box()
 
-    def _get_top_taste_artists(self, limit: int = 5) -> list[str]:
+    def _get_top_taste_artists(self, limit: int = 6) -> list[str]:
         ranked = [
             (artist, score)
             for artist, score in self.artist_scores.items()
@@ -599,17 +668,110 @@ class AetherStreamingApp(ctk.CTk):
                     )
 
     # ==========================================
+    # СИНХРОНИЗАЦИЯ СВОЕГО YOUTUBE-КАНАЛА / ПЛЕЙЛИСТОВ
+    # ==========================================
+    def _connect_youtube_channel(self, raw_input: str):
+        label, url = normalize_channel_input(raw_input)
+        if not url:
+            return
+        self.channel_handle = label
+        self.channel_url = url
+        self._save_user_state()
+        self._refresh_sidebar_taste_box()
+        self._sync_youtube_channel(refresh_wave_after=True)
+
+    def _disconnect_youtube_channel(self):
+        self.channel_handle = ""
+        self.channel_url = ""
+        self.channel_tracks.clear()
+        self._save_user_state()
+        self._refresh_sidebar_taste_box()
+        self._render_page()
+
+    def _sync_youtube_channel(self, refresh_wave_after: bool = False):
+        if not self.channel_url or self.channel_syncing:
+            return
+        self.channel_syncing = True
+        self._refresh_sidebar_taste_box()
+        if self.current_page == "wave":
+            self._render_page()
+
+        target_url = self.channel_url
+
+        def worker():
+            collected: list[TrackItem] = []
+            seen_uids: set[str] = set()
+
+            urls_to_scan: list[str] = []
+            if "playlist?list=" in target_url:
+                urls_to_scan.append(target_url)
+            else:
+                base = target_url.rstrip("/")
+                urls_to_scan.extend([f"{base}/playlists", f"{base}/videos"])
+
+            try:
+                with self._get_search_ydl(playlist_end=25) as ydl:
+                    for scan_url in urls_to_scan:
+                        info = ydl.extract_info(scan_url, download=False)
+                        if not info:
+                            continue
+                        entries = info.get("entries") or []
+                        for entry in entries:
+                            if not entry:
+                                continue
+                            entry_url = entry.get("url") or entry.get("webpage_url") or ""
+                            if "playlist?list=" in entry_url or entry.get("_type") == "playlist":
+                                sub_info = ydl.extract_info(entry_url, download=False)
+                                for sub_entry in (sub_info.get("entries") or []) if sub_info else []:
+                                    if not sub_entry or not self._is_valid_music_candidate(sub_entry):
+                                        continue
+                                    item = self._entry_to_track(sub_entry, reason=f"Канал {self.channel_handle}")
+                                    if item and item.uid not in seen_uids:
+                                        seen_uids.add(item.uid)
+                                        collected.append(item)
+                            else:
+                                if not self._is_valid_music_candidate(entry):
+                                    continue
+                                item = self._entry_to_track(entry, reason=f"Канал {self.channel_handle}")
+                                if item and item.uid not in seen_uids:
+                                    seen_uids.add(item.uid)
+                                    collected.append(item)
+                        if len(collected) >= 60:
+                            break
+            except Exception:
+                pass
+
+            def done():
+                self.channel_syncing = False
+                if collected:
+                    self.channel_tracks = collected[:100]
+                    for t in collected[:35]:
+                        self._record_positive_seed(t, weight=3.0, save=False)
+                    self._save_user_state()
+                    self._prefetch_batch(self.channel_tracks[:3])
+
+                self._refresh_sidebar_taste_box()
+                if refresh_wave_after:
+                    self._refresh_wave()
+                elif self.current_page in ("wave", "library"):
+                    self._render_page()
+
+            self.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ==========================================
     # КАРКАС ОКНА (3 ЗОНЫ: SIDEBAR / CONTENT / BOTTOM BAR)
     # ==========================================
     def _build_layout(self):
-        self.grid_columnconfigure(0, weight=0, minsize=235)
+        self.grid_columnconfigure(0, weight=0, minsize=240)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=0, minsize=88)
 
         # ---------- 1. ЛЕВАЯ ПАНЕЛЬ НАВИГАЦИИ ----------
         self.sidebar = ctk.CTkFrame(
-            self, fg_color=THEME["bg_sidebar"], corner_radius=0, width=235
+            self, fg_color=THEME["bg_sidebar"], corner_radius=0, width=240
         )
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_propagate(False)
@@ -653,7 +815,7 @@ class AetherStreamingApp(ctk.CTk):
             btn.grid(row=idx, column=0, sticky="ew", padx=14, pady=3)
             self.nav_buttons[page_id] = btn
 
-        # Нижний блок сайдбара: индикатор профиля вкуса
+        # Нижний блок сайдбара: YouTube-канал + профиль вкуса
         self.taste_summary_box = ctk.CTkFrame(
             self.sidebar,
             fg_color=THEME["bg_card"],
@@ -687,7 +849,6 @@ class AetherStreamingApp(ctk.CTk):
         self.bottom_bar.grid_columnconfigure(2, weight=1, uniform="bar")
         self.bottom_bar.grid_rowconfigure(0, weight=1)
 
-        # Левая секция бара
         bar_left = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         bar_left.grid(row=0, column=0, sticky="w", padx=18)
 
@@ -745,7 +906,6 @@ class AetherStreamingApp(ctk.CTk):
         )
         self.dislike_btn.pack(side="left", padx=2)
 
-        # Центральная секция бара
         bar_center = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         bar_center.grid(row=0, column=1, sticky="ew", padx=12)
         bar_center.grid_columnconfigure(0, weight=1)
@@ -854,7 +1014,6 @@ class AetherStreamingApp(ctk.CTk):
         )
         self.total_label.grid(row=0, column=2, padx=(6, 0))
 
-        # Правая секция бара
         bar_right = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
         bar_right.grid(row=0, column=2, sticky="e", padx=20)
 
@@ -911,12 +1070,32 @@ class AetherStreamingApp(ctk.CTk):
         for w in self.taste_summary_box.winfo_children():
             w.destroy()
 
+        row_idx = 0
+        if self.channel_url:
+            status_txt = "Синхронизация…" if self.channel_syncing else f"Канал: {self.channel_handle}"
+            ctk.CTkLabel(
+                self.taste_summary_box,
+                text=status_txt,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=self.accent_color,
+            ).grid(row=row_idx, column=0, sticky="w", padx=12, pady=(10, 2))
+            row_idx += 1
+
+            ctk.CTkLabel(
+                self.taste_summary_box,
+                text=f"Треков из плейлистов: {len(self.channel_tracks)}",
+                font=ctk.CTkFont(size=10),
+                text_color=THEME["text_muted"],
+            ).grid(row=row_idx, column=0, sticky="w", padx=12, pady=(0, 6))
+            row_idx += 1
+
         ctk.CTkLabel(
             self.taste_summary_box,
             text="Профиль вкуса",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=THEME["text_muted"],
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+        ).grid(row=row_idx, column=0, sticky="w", padx=12, pady=(8 if row_idx == 0 else 2, 3))
+        row_idx += 1
 
         seeds = self.custom_seeds + [
             a for a in self._get_top_taste_artists(4) if a not in self.custom_seeds
@@ -926,17 +1105,17 @@ class AetherStreamingApp(ctk.CTk):
             if len(summary_txt) > 54:
                 summary_txt = summary_txt[:51] + "..."
         else:
-            summary_txt = "Ставьте ♥ или добавьте артистов в Волне"
+            summary_txt = "Укажите свой YouTube-канал или ставьте ♥"
 
         ctk.CTkLabel(
             self.taste_summary_box,
             text=summary_txt,
             font=ctk.CTkFont(size=11),
             text_color=THEME["text_dim"],
-            wraplength=182,
+            wraplength=186,
             justify="left",
             anchor="w",
-        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+        ).grid(row=row_idx, column=0, sticky="w", padx=12, pady=(0, 10))
 
     # ==========================================
     # НАВИГАЦИЯ
@@ -965,11 +1144,11 @@ class AetherStreamingApp(ctk.CTk):
             self._render_library_page()
 
     # ==========================================
-    # СТРАНИЦА 1: «МОЯ ВОЛНА» (ПЕРСОНАЛИЗИРОВАННАЯ)
+    # СТРАНИЦА 1: «МОЯ ВОЛНА» + ПРИВЯЗКА YOUTUBE-КАНАЛА
     # ==========================================
     def _render_wave_page(self):
         container = ctk.CTkFrame(self.content_area, fg_color="transparent")
-        container.grid(row=0, column=0, sticky="nsew", padx=28, pady=22)
+        container.grid(row=0, column=0, sticky="nsew", padx=28, pady=20)
         container.grid_columnconfigure(0, weight=1)
         container.grid_rowconfigure(2, weight=1)
 
@@ -980,11 +1159,11 @@ class AetherStreamingApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border"],
         )
-        hero.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        hero.grid(row=0, column=0, sticky="ew", pady=(0, 14))
         hero.grid_columnconfigure(0, weight=1)
 
         hero_top = ctk.CTkFrame(hero, fg_color="transparent")
-        hero_top.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 12))
+        hero_top.grid(row=0, column=0, sticky="ew", padx=24, pady=(18, 12))
         hero_top.grid_columnconfigure(0, weight=1)
 
         title_col = ctk.CTkFrame(hero_top, fg_color="transparent")
@@ -1003,7 +1182,7 @@ class AetherStreamingApp(ctk.CTk):
         if top_artists:
             sub_info = f"Настроено под вас: {', '.join(top_artists[:3])}  •  {self.wave_mood}"
         else:
-            sub_info = "Слушайте, ставьте ♥ или укажите любимых артистов ниже"
+            sub_info = "Подключите свой YouTube-канал или укажите любимых артистов"
 
         ctk.CTkLabel(
             title_col,
@@ -1046,13 +1225,13 @@ class AetherStreamingApp(ctk.CTk):
         ).pack(side="left")
 
         tuning_box = ctk.CTkFrame(hero, fg_color="transparent")
-        tuning_box.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 18))
+        tuning_box.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 16))
 
         # Ряд 1: Настроение
         mood_row = ctk.CTkFrame(tuning_box, fg_color="transparent")
-        mood_row.pack(fill="x", pady=(0, 10))
+        mood_row.pack(fill="x", pady=(0, 9))
         ctk.CTkLabel(
-            mood_row, text="Настроение:", font=ctk.CTkFont(size=12), text_color=THEME["text_dim"], width=92, anchor="w"
+            mood_row, text="Настроение:", font=ctk.CTkFont(size=12), text_color=THEME["text_dim"], width=94, anchor="w"
         ).pack(side="left")
 
         for m in self.MOODS:
@@ -1073,11 +1252,90 @@ class AetherStreamingApp(ctk.CTk):
                 command=lambda val=m: self._set_wave_mood(val),
             ).pack(side="left", padx=3)
 
-        # Ряд 2: Мои ориентиры
+        # Ряд 2: Свой YouTube-канал или публичный плейлист
+        yt_row = ctk.CTkFrame(tuning_box, fg_color="transparent")
+        yt_row.pack(fill="x", pady=(0, 9))
+        ctk.CTkLabel(
+            yt_row, text="Мой YouTube:", font=ctk.CTkFont(size=12), text_color=THEME["text_dim"], width=94, anchor="w"
+        ).pack(side="left")
+
+        if self.channel_url:
+            badge_w = max(140, len(self.channel_handle) * 8 + 34)
+            ctk.CTkButton(
+                yt_row,
+                text=f"✓ {self.channel_handle} ({len(self.channel_tracks)} треков)",
+                width=badge_w,
+                height=28,
+                corner_radius=14,
+                fg_color=self.accent_soft,
+                hover_color=THEME["bg_hover"],
+                text_color=self.accent_color,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                command=lambda: self._open_channel_tab(),
+            ).pack(side="left", padx=(3, 6))
+
+            ctk.CTkButton(
+                yt_row,
+                text="Обновить",
+                width=78,
+                height=28,
+                corner_radius=14,
+                fg_color=THEME["bg_card"],
+                hover_color=THEME["bg_hover"],
+                text_color=THEME["text_main"],
+                font=ctk.CTkFont(size=11),
+                command=lambda: self._sync_youtube_channel(refresh_wave_after=True),
+            ).pack(side="left", padx=(0, 6))
+
+            ctk.CTkButton(
+                yt_row,
+                text="Отвязать",
+                width=74,
+                height=28,
+                corner_radius=14,
+                fg_color="transparent",
+                hover_color=THEME["bg_hover"],
+                text_color=THEME["text_dim"],
+                font=ctk.CTkFont(size=11),
+                command=self._disconnect_youtube_channel,
+            ).pack(side="left")
+        else:
+            self.channel_entry_var = tk.StringVar()
+            ch_entry = ctk.CTkEntry(
+                yt_row,
+                textvariable=self.channel_entry_var,
+                placeholder_text="@ник_канала или ссылка на публичный плейлист YouTube...",
+                width=345,
+                height=30,
+                corner_radius=15,
+                fg_color=THEME["bg_root"],
+                border_color=THEME["border"],
+                border_width=1,
+                text_color=THEME["text_main"],
+                placeholder_text_color=THEME["text_dim"],
+                font=ctk.CTkFont(size=12),
+            )
+            ch_entry.pack(side="left", padx=(3, 6))
+            ch_entry.bind("<Return>", lambda _e: self._connect_youtube_channel(self.channel_entry_var.get()))
+
+            ctk.CTkButton(
+                yt_row,
+                text="Подключить",
+                width=96,
+                height=30,
+                corner_radius=15,
+                fg_color=THEME["bg_card"],
+                hover_color=THEME["bg_hover"],
+                text_color=THEME["text_main"],
+                font=ctk.CTkFont(size=11, weight="bold"),
+                command=lambda: self._connect_youtube_channel(self.channel_entry_var.get()),
+            ).pack(side="left")
+
+        # Ряд 3: Ручные ориентиры вкуса
         seeds_row = ctk.CTkFrame(tuning_box, fg_color="transparent")
         seeds_row.pack(fill="x")
         ctk.CTkLabel(
-            seeds_row, text="Мой вкус:", font=ctk.CTkFont(size=12), text_color=THEME["text_dim"], width=92, anchor="w"
+            seeds_row, text="Мой вкус:", font=ctk.CTkFont(size=12), text_color=THEME["text_dim"], width=94, anchor="w"
         ).pack(side="left")
 
         self.seed_entry_var = tk.StringVar()
@@ -1085,7 +1343,7 @@ class AetherStreamingApp(ctk.CTk):
             seeds_row,
             textvariable=self.seed_entry_var,
             placeholder_text="Добавить артиста или стиль (напр. Кишлак, Synthwave)...",
-            width=310,
+            width=345,
             height=30,
             corner_radius=15,
             fg_color=THEME["bg_root"],
@@ -1101,7 +1359,7 @@ class AetherStreamingApp(ctk.CTk):
         ctk.CTkButton(
             seeds_row,
             text="+ Добавить",
-            width=88,
+            width=96,
             height=30,
             corner_radius=15,
             fg_color=THEME["bg_card"],
@@ -1113,8 +1371,8 @@ class AetherStreamingApp(ctk.CTk):
 
         if self.custom_seeds or self._get_top_taste_artists(4):
             tags_row = ctk.CTkFrame(tuning_box, fg_color="transparent")
-            tags_row.pack(fill="x", pady=(10, 0))
-            ctk.CTkLabel(tags_row, text="", width=92).pack(side="left")
+            tags_row.pack(fill="x", pady=(9, 0))
+            ctk.CTkLabel(tags_row, text="", width=94).pack(side="left")
 
             for s in self.custom_seeds[:6]:
                 chip_w = max(72, len(s) * 8 + 30)
@@ -1156,10 +1414,11 @@ class AetherStreamingApp(ctk.CTk):
             text_color=THEME["text_main"],
         ).pack(side="left")
 
-        if self.wave_fetching:
+        if self.wave_fetching or self.channel_syncing:
+            status_lbl = "Синхронизация канала…" if self.channel_syncing else "Подбираем под ваш вкус…"
             ctk.CTkLabel(
                 q_header,
-                text="Подбираем под ваш вкус...",
+                text=status_lbl,
                 font=ctk.CTkFont(size=11),
                 text_color=self.accent_color,
             ).pack(side="right")
@@ -1182,6 +1441,10 @@ class AetherStreamingApp(ctk.CTk):
 
         for idx, track in enumerate(self.wave_queue):
             self._build_track_row(scroll, idx, track, self.wave_queue, is_wave=True)
+
+    def _open_channel_tab(self):
+        self.library_subtab = "channel"
+        self._switch_page("library")
 
     def _add_custom_seed(self):
         val = self.seed_entry_var.get().strip()
@@ -1209,7 +1472,7 @@ class AetherStreamingApp(ctk.CTk):
             self._refresh_wave()
 
     # ==========================================
-    # СТРАНИЦА 2: ПОИСК (БЫСТРЫЙ YOUTUBE)
+    # СТРАНИЦА 2: ПОИСК (С КЭШЕМ И ПАРАЛЛЕЛЬНОЙ ПРЕДЗАГРУЗКОЙ)
     # ==========================================
     def _render_search_page(self):
         container = ctk.CTkFrame(self.content_area, fg_color="transparent")
@@ -1289,7 +1552,7 @@ class AetherStreamingApp(ctk.CTk):
         if getattr(self, "_is_searching", False):
             ctk.CTkLabel(
                 scroll,
-                text="Быстрый поиск треков...",
+                text="Ищем треки…",
                 text_color=THEME["text_muted"],
                 font=ctk.CTkFont(size=13),
             ).grid(row=0, column=0, pady=40)
@@ -1308,7 +1571,7 @@ class AetherStreamingApp(ctk.CTk):
             self._build_track_row(scroll, idx, track, self.search_results, is_wave=False)
 
     # ==========================================
-    # СТРАНИЦА 3: КОЛЛЕКЦИЯ
+    # СТРАНИЦА 3: КОЛЛЕКЦИЯ (ЛЮБИМЫЕ / МОЙ КАНАЛ / ФАЙЛЫ)
     # ==========================================
     def _render_library_page(self):
         container = ctk.CTkFrame(self.content_area, fg_color="transparent")
@@ -1340,9 +1603,22 @@ class AetherStreamingApp(ctk.CTk):
             command=lambda: self._switch_library_subtab("liked"),
         ).pack(side="left", padx=(0, 8))
 
+        ch_label = f"📺  Мой канал ({len(self.channel_tracks)})"
         ctk.CTkButton(
             tabs_row,
-            text=f"📁  Файлы и скачанное ({len(self.local_tracks)})",
+            text=ch_label,
+            height=34,
+            corner_radius=17,
+            fg_color=THEME["bg_card"] if self.library_subtab == "channel" else "transparent",
+            hover_color=THEME["bg_hover"],
+            text_color=THEME["text_main"] if self.library_subtab == "channel" else THEME["text_muted"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=lambda: self._switch_library_subtab("channel"),
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            tabs_row,
+            text=f"📁  Файлы ({len(self.local_tracks)})",
             height=34,
             corner_radius=17,
             fg_color=THEME["bg_card"] if self.library_subtab == "local" else "transparent",
@@ -1351,6 +1627,19 @@ class AetherStreamingApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             command=lambda: self._switch_library_subtab("local"),
         ).pack(side="left", padx=(0, 8))
+
+        if self.library_subtab == "channel" and self.channel_url:
+            ctk.CTkButton(
+                tabs_row,
+                text="↻ Обновить канал",
+                height=32,
+                corner_radius=10,
+                fg_color=THEME["bg_card"],
+                hover_color=THEME["bg_hover"],
+                text_color=THEME["text_main"],
+                font=ctk.CTkFont(size=12),
+                command=lambda: self._sync_youtube_channel(refresh_wave_after=False),
+            ).pack(side="right")
 
         if self.library_subtab == "local":
             ctk.CTkButton(
@@ -1386,13 +1675,21 @@ class AetherStreamingApp(ctk.CTk):
         scroll.grid(row=2, column=0, sticky="nsew")
         scroll.grid_columnconfigure(0, weight=1)
 
-        items = self.liked_tracks if self.library_subtab == "liked" else self.local_tracks
-        if not items:
+        if self.library_subtab == "liked":
+            items = self.liked_tracks
+            hint = "Ставьте ♥ понравившимся трекам — они появятся здесь и настроят Мою волну"
+        elif self.library_subtab == "channel":
+            items = self.channel_tracks
             hint = (
-                "Ставьте ♥ понравившимся трекам — они появятся здесь и настроят Мою волну"
-                if self.library_subtab == "liked"
-                else "Добавьте папку с музыкой или скачайте треки в MP3"
+                "Синхронизация треков канала…"
+                if self.channel_syncing
+                else "Подключите свой @канал или публичный плейлист во вкладке «Моя волна»"
             )
+        else:
+            items = self.local_tracks
+            hint = "Добавьте папку с музыкой или скачайте треки в MP3"
+
+        if not items:
             ctk.CTkLabel(scroll, text=hint, text_color=THEME["text_dim"], font=ctk.CTkFont(size=13)).grid(
                 row=0, column=0, pady=50
             )
@@ -1403,6 +1700,8 @@ class AetherStreamingApp(ctk.CTk):
 
     def _switch_library_subtab(self, sub: str):
         self.library_subtab = sub
+        if sub == "channel" and self.channel_tracks:
+            self._prefetch_batch(self.channel_tracks[:4])
         self._render_page()
 
     # ==========================================
@@ -1475,7 +1774,7 @@ class AetherStreamingApp(ctk.CTk):
         ).grid(row=0, column=4, padx=(0, 10))
 
     # ==========================================
-    # АЛГОРИТМ «МОЕЙ ВОЛНЫ» (ПО ВКУСУ + YOUTUBE RADIO)
+    # АЛГОРИТМ «МОЕЙ ВОЛНЫ» (ПО ВКУСУ + КАНАЛУ + YT RADIO)
     # ==========================================
     def _set_wave_mood(self, mood: str):
         self.wave_mood = mood
@@ -1507,32 +1806,32 @@ class AetherStreamingApp(ctk.CTk):
         """Возвращает (url_или_запрос_ytdlp, причина_рекомендации)."""
         mood_mod = self.MOOD_MODIFIERS.get(self.wave_mood, "")
 
-        # Стратегия 1: YouTube Radio (RD{vid}) по треку из истории вкуса
-        if self.seed_videos and self.wave_mood == "Любое" and random.random() < 0.60:
-            seed = random.choice(self.seed_videos[-15:])
+        # 1. YouTube Radio (RD{vid}) по треку из канала / лайков
+        if self.seed_videos and self.wave_mood == "Любое" and random.random() < 0.65:
+            seed = random.choice(self.seed_videos[-20:])
             vid = seed.get("vid")
             artist = seed.get("artist") or "ваших треков"
             if vid:
                 radio_url = f"https://www.youtube.com/watch?v={vid}&list=RD{vid}"
                 return radio_url, f"Похоже на {artist}"
 
-        # Стратегия 2: Поиск по явно заданным ориентирам пользователя (custom_seeds)
+        # 2. Поиск по явно заданным ориентирам пользователя
         if self.custom_seeds and random.random() < 0.70:
             artist = random.choice(self.custom_seeds)
             q = f"{artist} {mood_mod}".strip()
-            return f"ytsearch14:{q}", f"По ориентиру: {artist}"
+            return f"ytsearch12:{q}", f"По ориентиру: {artist}"
 
-        # Стратегия 3: Поиск по топ-исполнителям из профиля вкуса
+        # 3. Поиск по топ-исполнителям из профиля вкуса (канал + лайки)
         top_artists = self._get_top_taste_artists(limit=8)
         if top_artists:
             weights = [max(1.0, self.artist_scores.get(a, 1.0)) for a in top_artists]
             chosen = random.choices(top_artists, weights=weights, k=1)[0]
             q = f"{chosen} {mood_mod}".strip() if mood_mod else f"{chosen} треки"
-            return f"ytsearch14:{q}", f"На основе: {chosen}"
+            return f"ytsearch12:{q}", f"На основе: {chosen}"
 
-        # Стратегия 4: Стартовый поток для нового пользователя без истории
+        # 4. Стартовый поток для нового пользователя
         base = mood_mod if mood_mod else "indie electronic alternative music"
-        return f"ytsearch14:{base}", "Подборка волны"
+        return f"ytsearch12:{base}", "Подборка волны"
 
     def _is_valid_music_candidate(self, entry: dict) -> bool:
         title = (entry.get("title") or "").lower()
@@ -1562,9 +1861,7 @@ class AetherStreamingApp(ctk.CTk):
         def worker():
             candidates: list[TrackItem] = []
             try:
-                opts = dict(YDL_FAST_SEARCH_OPTS)
-                opts["playlistend"] = 18
-                with yt_dlp.YoutubeDL(opts) as ydl:
+                with self._get_search_ydl(playlist_end=16) as ydl:
                     info = ydl.extract_info(target_query, download=False)
                     for entry in (info.get("entries") or []) if info else []:
                         if not entry or not self._is_valid_music_candidate(entry):
@@ -1584,6 +1881,28 @@ class AetherStreamingApp(ctk.CTk):
             except Exception:
                 pass
 
+            # Подмешиваем трек прямо с привязанного канала пользователя, если он есть
+            if self.channel_tracks and random.random() < 0.55:
+                ch_pool = [
+                    t for t in self.channel_tracks
+                    if t.uid not in self.disliked_uids
+                    and t.uid not in self.session_played_uids
+                    and not any(ex.uid == t.uid for ex in self.wave_queue)
+                ]
+                if ch_pool:
+                    pick = random.choice(ch_pool)
+                    copy_item = TrackItem(
+                        title=pick.title,
+                        artist=pick.artist,
+                        duration=pick.duration,
+                        webpage_url=pick.webpage_url,
+                        thumbnail_url=pick.thumbnail_url,
+                        reason=f"Из вашего канала {self.channel_handle}",
+                    )
+                    copy_item.stream_url = pick.stream_url
+                    copy_item.stream_resolved_at = pick.stream_resolved_at
+                    candidates.insert(0, copy_item)
+
             candidates.sort(key=self._score_wave_candidate, reverse=True)
             ordered: list[TrackItem] = []
             last_artist = self.wave_queue[-1].artist if self.wave_queue else ""
@@ -1602,7 +1921,7 @@ class AetherStreamingApp(ctk.CTk):
                 if self.current_page == "wave":
                     self._render_page()
                 if self.wave_queue:
-                    self._prefetch_track_async(self.wave_queue[0])
+                    self._prefetch_batch(self.wave_queue[:4])
                 if autoplay and self.wave_queue:
                     self._play_from_list(self.wave_queue, 0, is_wave=True)
 
@@ -1623,14 +1942,24 @@ class AetherStreamingApp(ctk.CTk):
         if not query:
             return
         self._last_search_text = query
+        cache_key = query.lower()
+
+        if cache_key in self.search_cache:
+            self.search_results = self.search_cache[cache_key]
+            self._is_searching = False
+            if self.current_page == "search":
+                self._render_page()
+            self._prefetch_batch(self.search_results[:6])
+            return
+
         self._is_searching = True
         self._render_page()
 
         def worker():
             results: list[TrackItem] = []
             try:
-                with yt_dlp.YoutubeDL(YDL_FAST_SEARCH_OPTS) as ydl:
-                    info = ydl.extract_info(f"ytsearch12:{query}", download=False)
+                with self._get_search_ydl(playlist_end=10) as ydl:
+                    info = ydl.extract_info(f"ytsearch10:{query}", download=False)
                     for entry in (info.get("entries") or []) if info else []:
                         if not entry:
                             continue
@@ -1643,10 +1972,11 @@ class AetherStreamingApp(ctk.CTk):
             def done():
                 self._is_searching = False
                 self.search_results = results
+                if results:
+                    self.search_cache[cache_key] = results
                 if self.current_page == "search":
                     self._render_page()
-                for t in results[:2]:
-                    self._prefetch_track_async(t)
+                self._prefetch_batch(results[:6])
 
             self.after(0, done)
 
@@ -1721,7 +2051,7 @@ class AetherStreamingApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     # ==========================================
-    # ПРЕДЗАГРУЗКА ПОТОКОВ И БЫСТРЫЙ СТАРТ
+    # ПРЕДЗАГРУЗКА ПОТОКОВ В ПУЛЕ И МГНОВЕННЫЙ СТАРТ
     # ==========================================
     def _resolve_track_sync(self, track: TrackItem) -> str | None:
         if track.has_fresh_stream:
@@ -1731,27 +2061,24 @@ class AetherStreamingApp(ctk.CTk):
 
         if track.is_resolving:
             for _ in range(60):
-                time.sleep(0.1)
+                time.sleep(0.08)
                 if not track.is_resolving:
                     return track.stream_url
             return track.stream_url
 
         track.is_resolving = True
         try:
-            opts = dict(YDL_FAST_EXTRACT_OPTS)
-            opts["format"] = "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/best"
-            opts["noplaylist"] = True
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(track.webpage_url, download=False)
-                if info:
-                    url = info.get("url")
-                    if url:
-                        track.stream_url = url
-                        track.stream_resolved_at = time.time()
-                    if info.get("duration") and track.duration <= 0:
-                        track.duration = float(info["duration"])
-                    if not track.thumbnail_url and info.get("thumbnail"):
-                        track.thumbnail_url = info["thumbnail"]
+            ydl = self._get_extract_ydl()
+            info = ydl.extract_info(track.webpage_url, download=False)
+            if info:
+                url = info.get("url")
+                if url:
+                    track.stream_url = url
+                    track.stream_resolved_at = time.time()
+                if info.get("duration") and track.duration <= 0:
+                    track.duration = float(info["duration"])
+                if not track.thumbnail_url and info.get("thumbnail"):
+                    track.thumbnail_url = info["thumbnail"]
         except Exception:
             pass
         finally:
@@ -1759,20 +2086,20 @@ class AetherStreamingApp(ctk.CTk):
 
         return track.stream_url
 
-    def _prefetch_track_async(self, track: TrackItem):
-        if not track or not track.is_online or track.has_fresh_stream or track.is_resolving:
-            return
-        threading.Thread(
-            target=self._resolve_track_sync, args=(track,), daemon=True
-        ).start()
+    def _prefetch_batch(self, tracks: list[TrackItem]):
+        for t in tracks:
+            if t and t.is_online and not t.has_fresh_stream and not t.is_resolving:
+                self.prefetch_pool.submit(self._resolve_track_sync, t)
 
     def _prefetch_upcoming_in_queue(self, current_idx: int):
         if not self.active_queue:
             return
-        for offset in (1, 2):
-            nxt = current_idx + offset
-            if 0 <= nxt < len(self.active_queue):
-                self._prefetch_track_async(self.active_queue[nxt])
+        upcoming = [
+            self.active_queue[current_idx + offset]
+            for offset in (1, 2, 3)
+            if 0 <= current_idx + offset < len(self.active_queue)
+        ]
+        self._prefetch_batch(upcoming)
 
     # ==========================================
     # ВОСПРОИЗВЕДЕНИЕ, ОБУЧЕНИЕ ВКУСА И ПЕРЕКЛЮЧЕНИЕ
@@ -1816,20 +2143,17 @@ class AetherStreamingApp(ctk.CTk):
         self._update_bottom_bar(track, loading=need_resolve)
         self._render_page()
 
-        # 1. Локальный файл
         if not track.is_online and track.filepath:
             self.engine.play_source(track.filepath, start_sec=0.0)
             self._sync_play_button()
             return
 
-        # 2. Онлайн-трек уже предзагружен — запускаем мгновенно
         if track.has_fresh_stream and track.stream_url:
             self.engine.play_source(track.stream_url, start_sec=0.0)
             self._sync_play_button()
             self._load_bar_cover_async(track)
             return
 
-        # 3. Получаем прямую ссылку на поток в фоне
         self.engine.stop()
         self._sync_play_button()
 
@@ -1849,7 +2173,7 @@ class AetherStreamingApp(ctk.CTk):
                 else:
                     self.bar_source_badge.configure(text="ERR")
                     if self.is_wave_session:
-                        self.after(400, self._on_next)
+                        self.after(300, self._on_next)
 
             self.after(0, on_ready)
 
@@ -1905,7 +2229,7 @@ class AetherStreamingApp(ctk.CTk):
         )
 
         if track.is_online:
-            self.bar_source_badge.configure(text="БУФЕР..." if loading else "STREAM")
+            self.bar_source_badge.configure(text="СТАРТ…" if loading else "STREAM")
             self.bar_download_btn.configure(state="normal", text="↓ MP3")
             self.bar_download_btn.pack(side="left", padx=(0, 8))
         else:
