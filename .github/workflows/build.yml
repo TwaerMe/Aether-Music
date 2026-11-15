@@ -25,7 +25,7 @@ jobs:
 
       - name: Build executable with PyInstaller
         run: |
-          pyinstaller --noconfirm --onefile --windowed --collect-all customtkinter --name "AetherPlayer" main.py
+          pyinstaller --noconfirm --onefile --windowed --collect-all customtkinter --collect-all imageio_ffmpeg --collect-all sounddevice --collect-all _sounddevice_data --hidden-import yt_dlp --name "AetherPlayer" main.py
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
