@@ -5,5 +5,6 @@ sounddevice>=0.4.7
 numpy>=1.26.0
 mutagen>=1.47.0
 Pillow>=10.0.0
+pystray>=0.19.5
 requests>=2.31.0
 pyinstaller>=6.0.0

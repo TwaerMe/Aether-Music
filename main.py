@@ -14,6 +14,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog
+import webbrowser
 
 import customtkinter as ctk
 import imageio_ffmpeg
@@ -24,7 +25,16 @@ import sounddevice as sd
 import yt_dlp
 from mutagen import File as MutagenFile
 from mutagen.id3 import APIC
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
+
+from google_sync import (
+    GoogleAuthError,
+    GoogleCloudSyncClient,
+    GoogleOAuthConfig,
+    GoogleOAuthLoopbackFlow,
+    merge_user_states,
+)
+from tray_manager import TrayManager, create_app_icon_image
 
 # ==========================================
 # ПАЛИТРА (МИНИМАЛИЗМ В ДУХЕ SPOTIFY / ЯНДЕКС МУЗЫКИ, БЕЗ НЕОНА)
@@ -148,26 +158,8 @@ def extract_video_id(url: str | None) -> str | None:
     return m.group(1) if m else None
 
 
-def normalize_channel_input(raw: str) -> tuple[str, str]:
-    """Превращает @handle, ссылку на канал или плейлист в (display_name, url)."""
-    val = raw.strip()
-    if not val:
-        return "", ""
-
-    if "list=" in val:
-        m = re.search(r"list=([0-9A-Za-z_-]+)", val)
-        if m:
-            plist_id = m.group(1)
-            return f"Плейлист ({plist_id[:10]}…)", f"https://www.youtube.com/playlist?list={plist_id}"
-
-    if val.startswith("http://") or val.startswith("https://"):
-        clean_url = val.rstrip("/")
-        handle_m = re.search(r"youtube\.com/(@[^/?#]+)", clean_url)
-        label = handle_m.group(1) if handle_m else clean_url.split("/")[-1]
-        return label, clean_url
-
-    handle = val if val.startswith("@") else f"@{val}"
-    return handle, f"https://www.youtube.com/{handle}"
+def make_circle_avatar(img: Image.Image, size=(34, 34)) -> Image.Image:
+    return make_rounded_cover(img, size=size, radius=size[0] // 2)
 
 
 def extract_stream_url_from_info(info: dict | None) -> str | None:
@@ -911,6 +903,14 @@ class AetherStreamingApp(ctk.CTk):
         self.geometry("1180x740")
         self.minsize(980, 640)
         self.configure(fg_color=THEME["bg_root"])
+        self._window_icon_ref = None
+        try:
+            icon_pil = create_app_icon_image(64, accent=THEME["wave_gold"])
+            if icon_pil is not None:
+                self._window_icon_ref = ImageTk.PhotoImage(icon_pil)
+                self.iconphoto(True, self._window_icon_ref)
+        except Exception:
+            pass
 
         self.engine = StreamAudioEngine(
             on_track_end_callback=lambda: self.after(0, self._on_track_finished),
@@ -926,13 +926,11 @@ class AetherStreamingApp(ctk.CTk):
         # Кэш поисковых запросов
         self.search_cache: OrderedDict[str, list[TrackItem]] = OrderedDict()
 
-        # Профиль вкуса, YouTube-канал, история, очередь
+        # Профиль вкуса, история, очередь и аккаунт Google
         self.liked_tracks: list[TrackItem] = []
+        self.liked_timestamps: dict[str, float] = {}
+        self.unliked_timestamps: dict[str, float] = {}
         self.history_tracks: list[TrackItem] = []
-        self.channel_tracks: list[TrackItem] = []
-        self.channel_handle: str = ""
-        self.channel_url: str = ""
-        self.channel_syncing: bool = False
 
         self.disliked_uids: set[str] = set()
         self.session_played_uids: set[str] = set()
@@ -940,6 +938,18 @@ class AetherStreamingApp(ctk.CTk):
         self.artist_scores: dict[str, float] = {}
         self.seed_videos: list[dict] = []
         self.custom_seeds: list[str] = []
+        self.custom_seed_timestamps: dict[str, float] = {}
+        self.removed_seed_timestamps: dict[str, float] = {}
+        self.state_updated_at: float = 0.0
+
+        self.google_sync = GoogleCloudSyncClient(APP_DATA_DIR)
+        self.google_sync_status: str = "Синхронизировано" if self.google_sync.is_signed_in else ""
+        self.google_syncing: bool = False
+        self._cloud_dirty: bool = False
+        self._cloud_sync_timer: str | None = None
+        self._active_oauth_flow: GoogleOAuthLoopbackFlow | None = None
+        self._google_avatar_img: ctk.CTkImage | None = None
+        self._google_avatar_url: str = ""
 
         self.local_tracks: list[TrackItem] = []
         self.search_results: list[TrackItem] = []
@@ -956,7 +966,7 @@ class AetherStreamingApp(ctk.CTk):
 
         # Состояние навигации и фильтров
         self.current_page: str = "wave"       # "wave" | "search" | "library" | "queue"
-        self.library_subtab: str = "liked"    # "liked" | "channel" | "history" | "local"
+        self.library_subtab: str = "liked"    # "liked" | "history" | "local"
         self.library_filter_text: str = ""
         self.wave_mood: str = "Любое"
         self.wave_fetching: bool = False
@@ -990,6 +1000,20 @@ class AetherStreamingApp(ctk.CTk):
             size=(40, 40),
         )
 
+        # Системный трей (сворачивание вместо закрытия)
+        self.tray = TrayManager(
+            on_open=lambda: self.after(0, self._restore_from_tray),
+            on_play_pause=lambda: self.after(0, self._on_play_pause),
+            on_next=lambda: self.after(0, self._on_next),
+            on_prev=lambda: self.after(0, self._on_prev),
+            on_toggle_like=lambda: self.after(0, self._toggle_like_current),
+            on_quit=lambda: self.after(0, self._quit_app),
+            get_play_state=lambda: self.engine.is_playing and not self.engine.is_paused,
+            get_liked_state=lambda: bool(self.current_track and self._is_liked(self.current_track)),
+            accent=THEME["wave_gold"],
+        )
+        self.tray.start()
+
         self._load_user_state()
         self._build_layout()
         self._bind_shortcuts()
@@ -997,17 +1021,17 @@ class AetherStreamingApp(ctk.CTk):
 
         # Асинхронная загрузка локальных файлов из ~/Music/Aether без фриза при старте
         self._load_downloads_folder_async()
+        self._prefill_wave_if_empty()
 
-        if self.channel_url:
-            self._sync_youtube_channel(refresh_wave_after=True)
-        else:
-            self._prefill_wave_if_empty()
+        # Тихая синхронизация с Google при запуске, если пользователь уже вошел
+        if self.google_sync.is_signed_in:
+            self._sync_google_cloud_async(pull_first=True)
 
         # Глобальные медиа-клавиши Windows (Play/Pause, Next, Prev даже в свернутом виде)
         if os.name == "nt":
             threading.Thread(target=self._windows_media_keys_watcher, daemon=True, name="media-keys").start()
 
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.protocol("WM_DELETE_WINDOW", self._on_window_close_request)
         self._tick_loop()
 
     # ==========================================
@@ -1052,71 +1076,135 @@ class AetherStreamingApp(ctk.CTk):
     # ==========================================
     # АТОМАРНОЕ СОХРАНЕНИЕ И ЗАГРУЗКА СОСТОЯНИЯ
     # ==========================================
+    def _export_state_dict(self) -> dict:
+        return {
+            "schema_version": 2,
+            "updated_at": self.state_updated_at or time.time(),
+            "liked_tracks": [t.to_dict() for t in self.liked_tracks],
+            "liked_timestamps": dict(self.liked_timestamps),
+            "unliked_timestamps": dict(self.unliked_timestamps),
+            "history_tracks": [t.to_dict() for t in self.history_tracks[:80]],
+            "disliked_uids": list(self.disliked_uids)[-500:],
+            "artist_scores": dict(self.artist_scores),
+            "seed_videos": list(self.seed_videos[-45:]),
+            "custom_seeds": list(self.custom_seeds[:12]),
+            "custom_seed_timestamps": dict(self.custom_seed_timestamps),
+            "removed_seed_timestamps": dict(self.removed_seed_timestamps),
+            "volume": round(self.engine.volume, 3),
+            "eq_preset": self.engine.eq_preset,
+            "normalize_audio": self.engine.normalize_audio,
+            "wave_mood": self.wave_mood,
+        }
+
+    def _apply_state_dict(self, data: dict, update_ui: bool = False):
+        self.state_updated_at = float(data.get("updated_at") or time.time())
+        self.liked_tracks = [TrackItem.from_dict(x) for x in data.get("liked_tracks", []) if isinstance(x, dict)]
+        self.liked_timestamps = {
+            str(k): float(v) for k, v in (data.get("liked_timestamps") or {}).items()
+        }
+        self.unliked_timestamps = {
+            str(k): float(v) for k, v in (data.get("unliked_timestamps") or {}).items()
+        }
+        self.history_tracks = [TrackItem.from_dict(x) for x in data.get("history_tracks", []) if isinstance(x, dict)][:80]
+        self.disliked_uids = set(str(x) for x in (data.get("disliked_uids") or []))
+        self.artist_scores = {str(k): float(v) for k, v in (data.get("artist_scores") or {}).items()}
+        self.seed_videos = list(data.get("seed_videos") or [])[-45:]
+        self.custom_seeds = [str(s) for s in (data.get("custom_seeds") or [])[:12]]
+        self.custom_seed_timestamps = {
+            str(k): float(v) for k, v in (data.get("custom_seed_timestamps") or {}).items()
+        }
+        self.removed_seed_timestamps = {
+            str(k): float(v) for k, v in (data.get("removed_seed_timestamps") or {}).items()
+        }
+
+        # Восстанавливаем настройки плеера
+        self.engine.volume = max(0.0, min(1.0, float(data.get("volume", 0.72))))
+        eq = str(data.get("eq_preset", "flat"))
+        self.engine.eq_preset = eq if eq in EQ_PRESETS else "flat"
+        self.engine.normalize_audio = bool(data.get("normalize_audio", False))
+        mood = str(data.get("wave_mood", "Любое"))
+        self.wave_mood = mood if mood in self.MOODS else "Любое"
+
+        if not self.seed_videos and self.liked_tracks:
+            for t in self.liked_tracks[:20]:
+                if t.video_id:
+                    self.seed_videos.append({"vid": t.video_id, "title": t.title, "artist": t.artist})
+                self._adjust_artist_score(t.artist, 3.0, save=False)
+
+        if update_ui:
+            try:
+                if hasattr(self, "volume_slider"):
+                    self.volume_slider.set(self.engine.volume)
+                if hasattr(self, "eq_btn"):
+                    eq_label, _ = EQ_PRESETS.get(self.engine.eq_preset, ("EQ: Ровный", ""))
+                    self.eq_btn.configure(
+                        text=eq_label,
+                        fg_color=self.accent_soft if self.engine.eq_preset != "flat" else THEME["bg_card"],
+                        text_color=self.accent_color if self.engine.eq_preset != "flat" else THEME["text_muted"],
+                    )
+                if self.current_track and hasattr(self, "like_btn"):
+                    liked = self._is_liked(self.current_track)
+                    self.like_btn.configure(
+                        text="♥" if liked else "♡",
+                        text_color=THEME["like_red"] if liked else THEME["text_muted"],
+                    )
+                self._refresh_sidebar_taste_box()
+                self._render_page()
+                self._update_tray_state()
+            except Exception:
+                pass
+
+    def _active_state_file(self) -> str:
+        if self.google_sync.is_signed_in and self.google_sync.session:
+            prof_dir = os.path.join(APP_DATA_DIR, "profiles")
+            os.makedirs(prof_dir, exist_ok=True)
+            safe_sub = re.sub(r"[^0-9A-Za-z_-]", "_", self.google_sync.session.sub)
+            return os.path.join(prof_dir, f"{safe_sub}.json")
+        return STATE_FILE
+
     def _load_user_state(self):
         try:
-            if not os.path.exists(STATE_FILE):
+            target_file = self._active_state_file()
+            if not os.path.exists(target_file):
+                target_file = STATE_FILE
+            if not os.path.exists(target_file):
                 return
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
+            with open(target_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-
-            self.liked_tracks = [TrackItem.from_dict(x) for x in data.get("liked_tracks", [])]
-            self.history_tracks = [TrackItem.from_dict(x) for x in data.get("history_tracks", [])][:80]
-            self.channel_tracks = [TrackItem.from_dict(x) for x in data.get("channel_tracks", [])]
-            self.channel_handle = str(data.get("channel_handle", ""))
-            self.channel_url = str(data.get("channel_url", ""))
-            self.disliked_uids = set(data.get("disliked_uids", []))
-            self.artist_scores = {str(k): float(v) for k, v in data.get("artist_scores", {}).items()}
-            self.seed_videos = list(data.get("seed_videos", []))[-45:]
-            self.custom_seeds = list(data.get("custom_seeds", []))[:12]
-
-            # Восстанавливаем настройки плеера
-            self.engine.volume = max(0.0, min(1.0, float(data.get("volume", 0.72))))
-            eq = str(data.get("eq_preset", "flat"))
-            self.engine.eq_preset = eq if eq in EQ_PRESETS else "flat"
-            self.engine.normalize_audio = bool(data.get("normalize_audio", False))
-            mood = str(data.get("wave_mood", "Любое"))
-            self.wave_mood = mood if mood in self.MOODS else "Любое"
-
-            if not self.seed_videos and (self.liked_tracks or self.channel_tracks):
-                for t in (self.liked_tracks + self.channel_tracks)[:20]:
-                    if t.video_id:
-                        self.seed_videos.append({"vid": t.video_id, "title": t.title, "artist": t.artist})
-                    self._adjust_artist_score(t.artist, 3.0, save=False)
+            if isinstance(data, dict):
+                self._apply_state_dict(data, update_ui=False)
         except Exception:
             pass
 
-    def _save_user_state(self):
+    def _write_state_file_atomic(self, filepath: str, data: dict):
+        parent = os.path.dirname(os.path.abspath(filepath))
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="state_", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, filepath)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    def _save_user_state(self, sync_cloud: bool = True):
+        self.state_updated_at = time.time()
+        data = self._export_state_dict()
         with self._state_lock:
             try:
-                os.makedirs(APP_DATA_DIR, exist_ok=True)
-                data = {
-                    "liked_tracks": [t.to_dict() for t in self.liked_tracks],
-                    "history_tracks": [t.to_dict() for t in self.history_tracks[:80]],
-                    "channel_tracks": [t.to_dict() for t in self.channel_tracks[:120]],
-                    "channel_handle": self.channel_handle,
-                    "channel_url": self.channel_url,
-                    "disliked_uids": list(self.disliked_uids)[-500:],
-                    "artist_scores": self.artist_scores,
-                    "seed_videos": self.seed_videos[-45:],
-                    "custom_seeds": self.custom_seeds[:12],
-                    "volume": round(self.engine.volume, 3),
-                    "eq_preset": self.engine.eq_preset,
-                    "normalize_audio": self.engine.normalize_audio,
-                    "wave_mood": self.wave_mood,
-                }
-                fd, tmp_path = tempfile.mkstemp(prefix="state_", suffix=".tmp", dir=APP_DATA_DIR)
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
-                    os.replace(tmp_path, STATE_FILE)
-                finally:
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
+                self._write_state_file_atomic(STATE_FILE, data)
+                if self.google_sync.is_signed_in:
+                    self._write_state_file_atomic(self._active_state_file(), data)
             except Exception:
                 pass
+
+        if sync_cloud and self.google_sync.is_signed_in and not self._closing:
+            self._cloud_dirty = True
+            self._schedule_cloud_push()
 
     def _adjust_artist_score(self, artist: str, delta: float, save: bool = True):
         key = clean_artist_name(artist)
@@ -1176,97 +1264,447 @@ class AetherStreamingApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True, name="scan-downloads").start()
 
     # ==========================================
-    # СИНХРОНИЗАЦИЯ YOUTUBE-КАНАЛА / ПЛЕЙЛИСТА
+    # СИСТЕМНЫЙ ТРЕЙ (СВОРАЧИВАНИЕ И ВОССТАНОВЛЕНИЕ)
     # ==========================================
-    def _connect_youtube_channel(self, raw_input: str):
-        label, url = normalize_channel_input(raw_input)
-        if not url:
+    def _on_window_close_request(self):
+        """При нажатии на крестик сворачиваем в системный трей, если трей активен."""
+        if self.tray.is_running:
+            self._save_user_state(sync_cloud=True)
+            self.withdraw()
+            self.tray.notify_minimized_once()
+        else:
+            self._quit_app()
+
+    def _restore_from_tray(self):
+        if self._closing:
             return
-        self.channel_handle = label
-        self.channel_url = url
-        self._save_user_state()
-        self._refresh_sidebar_taste_box()
-        self._sync_youtube_channel(refresh_wave_after=True)
+        try:
+            self.deiconify()
+            self.state("normal")
+            self.attributes("-topmost", True)
+            self.lift()
+            self.focus_force()
+            self.after(60, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
 
-    def _disconnect_youtube_channel(self):
-        self.channel_handle = ""
-        self.channel_url = ""
-        self.channel_tracks.clear()
-        self._save_user_state()
-        self._refresh_sidebar_taste_box()
-        self._render_page()
-
-    def _sync_youtube_channel(self, refresh_wave_after: bool = False):
-        if not self.channel_url or self.channel_syncing:
+    def _update_tray_state(self):
+        if not hasattr(self, "tray"):
             return
-        self.channel_syncing = True
-        self._refresh_sidebar_taste_box()
-        self._update_wave_status_label()
+        if self.current_track:
+            self.tray.update_state(self.current_track.title, self.current_track.artist)
+        else:
+            self.tray.update_state(None, None)
 
-        target_url = self.channel_url
-
-        def worker():
-            collected: list[TrackItem] = []
-            seen_uids: set[str] = set()
-            urls_to_scan: list[str] = []
-            if "playlist?list=" in target_url:
-                urls_to_scan.append(target_url)
-            else:
-                base = target_url.rstrip("/")
-                urls_to_scan.extend([f"{base}/playlists", f"{base}/videos"])
-
+    # ==========================================
+    # АККАУНТ GOOGLE И ОБЛАЧНАЯ СИНХРОНИЗАЦИЯ
+    # ==========================================
+    def _schedule_cloud_push(self, delay_ms: int = 2500):
+        if not self.google_sync.is_signed_in or self._closing:
+            return
+        if self._cloud_sync_timer is not None:
             try:
-                with self._get_search_ydl(playlist_end=25) as ydl:
-                    for scan_url in urls_to_scan:
-                        info = ydl.extract_info(scan_url, download=False)
-                        if not info:
-                            continue
-                        for entry in (info.get("entries") or []):
-                            if not entry:
-                                continue
-                            entry_url = entry.get("url") or entry.get("webpage_url") or ""
-                            if "playlist?list=" in entry_url or entry.get("_type") == "playlist":
-                                sub_info = ydl.extract_info(entry_url, download=False)
-                                for sub_entry in (sub_info.get("entries") or []) if sub_info else []:
-                                    if not sub_entry or not self._is_valid_music_candidate(sub_entry):
-                                        continue
-                                    item = self._entry_to_track(sub_entry, reason=f"Канал {self.channel_handle}")
-                                    if item and item.uid not in seen_uids:
-                                        seen_uids.add(item.uid)
-                                        collected.append(item)
-                            else:
-                                if not self._is_valid_music_candidate(entry):
-                                    continue
-                                item = self._entry_to_track(entry, reason=f"Канал {self.channel_handle}")
-                                if item and item.uid not in seen_uids:
-                                    seen_uids.add(item.uid)
-                                    collected.append(item)
-                        if len(collected) >= 70:
-                            break
+                self.after_cancel(self._cloud_sync_timer)
             except Exception:
                 pass
+            self._cloud_sync_timer = None
+        self._cloud_sync_timer = self.after(delay_ms, self._flush_scheduled_cloud_push)
+
+    def _flush_scheduled_cloud_push(self):
+        self._cloud_sync_timer = None
+        if self.google_sync.is_signed_in and not self._closing:
+            self._sync_google_cloud_async(pull_first=False)
+
+    def _sync_google_cloud_async(self, pull_first: bool = True, refresh_wave_after: bool = False):
+        if not self.google_sync.is_signed_in or self.google_syncing or self._closing:
+            return
+
+        self.google_syncing = True
+        self.google_sync_status = "Синхронизация…"
+        self._refresh_sidebar_account_box()
+
+        local_snapshot = self._export_state_dict()
+
+        def worker():
+            merged_state: dict | None = None
+            err_msg: str | None = None
+            try:
+                payload_to_push = local_snapshot
+                if pull_first:
+                    cloud_state = self.google_sync.pull_profile()
+                    if cloud_state:
+                        merged_state = merge_user_states(local_snapshot, cloud_state)
+                        payload_to_push = merged_state
+                self.google_sync.push_profile(payload_to_push)
+            except GoogleAuthError as exc:
+                err_msg = str(exc)
+            except Exception:
+                err_msg = "Нет связи с Google"
 
             def done():
-                self.channel_syncing = False
-                if collected:
-                    self.channel_tracks = collected[:100]
-                    for t in collected[:35]:
-                        self._record_positive_seed(t, weight=3.0, save=False)
-                    self._save_user_state()
-                    self._prefetch_batch(self.channel_tracks[:3])
-
-                self._refresh_sidebar_taste_box()
-                if refresh_wave_after:
-                    self._refresh_wave()
-                elif self.current_page == "library" and self.library_subtab == "channel":
-                    self._render_page()
+                self.google_syncing = False
+                if err_msg:
+                    self.google_sync_status = err_msg[:36]
                 else:
-                    self._update_wave_status_label()
+                    self._cloud_dirty = False
+                    self.google_sync_status = "Синхронизировано"
+                    if merged_state is not None:
+                        self._apply_state_dict(merged_state, update_ui=True)
+                        self._save_user_state(sync_cloud=False)
+                        if refresh_wave_after:
+                            self._refresh_wave()
+                self._refresh_sidebar_account_box()
 
             if not self._closing:
                 self.after(0, done)
 
-        threading.Thread(target=worker, daemon=True, name="sync-channel").start()
+        threading.Thread(target=worker, daemon=True, name="google-sync").start()
+
+    def _load_google_avatar_async(self, url: str):
+        if not url or url == self._google_avatar_url:
+            return
+        self._google_avatar_url = url
+
+        def on_pil(pil_img: Image.Image):
+            circ = make_circle_avatar(pil_img, size=(34, 34))
+
+            def apply():
+                if self._closing or not self.google_sync.is_signed_in:
+                    return
+                self._google_avatar_img = ctk.CTkImage(light_image=circ, dark_image=circ, size=(34, 34))
+                self._refresh_sidebar_account_box()
+
+            if not self._closing:
+                self.after(0, apply)
+
+        self.cover_cache.fetch_pil_async(url, on_pil)
+
+    def _sign_out_google(self):
+        if self._cloud_sync_timer is not None:
+            try:
+                self.after_cancel(self._cloud_sync_timer)
+            except Exception:
+                pass
+            self._cloud_sync_timer = None
+        self._save_user_state(sync_cloud=False)
+        self.google_sync.sign_out()
+        self.google_sync_status = ""
+        self.google_syncing = False
+        self._cloud_dirty = False
+        self._google_avatar_img = None
+        self._google_avatar_url = ""
+        self._refresh_sidebar_account_box()
+
+    def _open_google_auth_dialog(self, force_setup: bool = False):
+        if hasattr(self, "_auth_dialog") and self._auth_dialog is not None:
+            try:
+                if self._auth_dialog.winfo_exists():
+                    self._auth_dialog.lift()
+                    self._auth_dialog.focus_force()
+                    return
+            except Exception:
+                pass
+
+        dialog = ctk.CTkToplevel(self)
+        self._auth_dialog = dialog
+        dialog.title("Вход через Google — Aether Music")
+        dialog.geometry("470x410")
+        dialog.resizable(False, False)
+        dialog.configure(fg_color=THEME["bg_sidebar"])
+        dialog.transient(self)
+        dialog.grab_set()
+
+        body = ctk.CTkFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=24, pady=20)
+
+        def on_dialog_close():
+            if self._active_oauth_flow is not None:
+                self._active_oauth_flow.cancel()
+                self._active_oauth_flow = None
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+
+        dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+
+        status_var = tk.StringVar(value="")
+
+        def render_waiting_view():
+            for w in body.winfo_children():
+                w.destroy()
+
+            ctk.CTkLabel(
+                body,
+                text="Вход в аккаунт Google",
+                font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
+                text_color=THEME["text_main"],
+            ).pack(anchor="w", pady=(6, 6))
+
+            ctk.CTkLabel(
+                body,
+                text="Все ваши лайкнутые треки, история прослушивания и профиль рекомендаций «Моей волны» будут автоматически сохраняться в вашем Google аккаунте.",
+                font=ctk.CTkFont(size=12),
+                text_color=THEME["text_muted"],
+                wraplength=420,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 18))
+
+            status_box = ctk.CTkFrame(
+                body, fg_color=THEME["bg_card"], corner_radius=12, border_width=1, border_color=THEME["border"]
+            )
+            status_box.pack(fill="x", pady=(0, 16))
+
+            status_lbl = ctk.CTkLabel(
+                status_box,
+                textvariable=status_var,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=self.accent_color,
+                wraplength=390,
+                justify="left",
+            )
+            status_lbl.pack(anchor="w", padx=16, pady=16)
+
+            btn_row = ctk.CTkFrame(body, fg_color="transparent")
+            btn_row.pack(fill="x", pady=(8, 0))
+
+            ctk.CTkButton(
+                btn_row,
+                text="Сменить OAuth-ключ",
+                height=34,
+                corner_radius=10,
+                fg_color=THEME["bg_card"],
+                hover_color=THEME["bg_hover"],
+                text_color=THEME["text_muted"],
+                font=ctk.CTkFont(size=12),
+                command=lambda: (
+                    self._active_oauth_flow.cancel() if self._active_oauth_flow else None,
+                    render_setup_view(),
+                ),
+            ).pack(side="left")
+
+            ctk.CTkButton(
+                btn_row,
+                text="Отмена",
+                width=96,
+                height=34,
+                corner_radius=10,
+                fg_color="transparent",
+                hover_color=THEME["bg_hover"],
+                text_color=THEME["text_main"],
+                font=ctk.CTkFont(size=12),
+                command=on_dialog_close,
+            ).pack(side="right")
+
+            start_browser_flow()
+
+        def start_browser_flow():
+            cfg = self.google_sync.config
+            if cfg is None or not cfg.is_valid:
+                render_setup_view()
+                return
+
+            status_var.set("Открываем браузер… Выберите аккаунт Google и подтвердите доступ.")
+            flow = GoogleOAuthLoopbackFlow(cfg)
+            self._active_oauth_flow = flow
+
+            def worker():
+                try:
+                    session = flow.run(timeout_sec=180.0)
+                    self.google_sync.set_session(session)
+
+                    def on_ok():
+                        self._active_oauth_flow = None
+                        try:
+                            if dialog.winfo_exists():
+                                dialog.destroy()
+                        except Exception:
+                            pass
+                        self._google_avatar_img = None
+                        self._google_avatar_url = ""
+                        self._refresh_sidebar_account_box()
+                        self._sync_google_cloud_async(pull_first=True, refresh_wave_after=True)
+
+                    if not self._closing:
+                        self.after(0, on_ok)
+                except GoogleAuthError as exc:
+                    msg = str(exc)
+
+                    def on_err():
+                        self._active_oauth_flow = None
+                        if dialog.winfo_exists():
+                            status_var.set(f"Ошибка: {msg}")
+
+                    if not self._closing:
+                        self.after(0, on_err)
+                except Exception as exc:
+                    msg = str(exc)
+
+                    def on_err():
+                        self._active_oauth_flow = None
+                        if dialog.winfo_exists():
+                            status_var.set(f"Не удалось выполнить вход: {msg}")
+
+                    if not self._closing:
+                        self.after(0, on_err)
+
+            threading.Thread(target=worker, daemon=True, name="google-oauth").start()
+
+        def render_setup_view():
+            for w in body.winfo_children():
+                w.destroy()
+
+            ctk.CTkLabel(
+                body,
+                text="Подключение Google аккаунта",
+                font=ctk.CTkFont(family="Segoe UI", size=19, weight="bold"),
+                text_color=THEME["text_main"],
+            ).pack(anchor="w", pady=(0, 6))
+
+            ctk.CTkLabel(
+                body,
+                text=(
+                    "Для входа без сторонних серверов Aether Music сохраняет ваши лайки и рекомендации "
+                    "в скрытом хранилище Google Drive (appDataFolder).\n"
+                    "1. Создайте бесплатный OAuth Client ID (тип: Desktop app) в Google Cloud Console "
+                    "и включите Google Drive API.\n"
+                    "2. Загрузите скачанный JSON-файл или вставьте Client ID ниже."
+                ),
+                font=ctk.CTkFont(size=11),
+                text_color=THEME["text_muted"],
+                wraplength=422,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 12))
+
+            top_actions = ctk.CTkFrame(body, fg_color="transparent")
+            top_actions.pack(fill="x", pady=(0, 12))
+
+            def on_pick_json():
+                fp = filedialog.askopenfilename(
+                    parent=dialog,
+                    title="Выберите Google client_secret.json",
+                    filetypes=[("JSON Files", "*.json")],
+                )
+                if not fp:
+                    return
+                try:
+                    cfg = GoogleOAuthConfig.load_from_file(fp)
+                    self.google_sync.set_config(cfg)
+                    status_var.set("")
+                    render_waiting_view()
+                except GoogleAuthError as exc:
+                    status_var.set(str(exc))
+
+            ctk.CTkButton(
+                top_actions,
+                text="Выбрать client_secret.json",
+                height=34,
+                corner_radius=10,
+                fg_color=self.accent_color,
+                hover_color=hex_adjust_brightness(self.accent_color, 1.1),
+                text_color="#0D0F12",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                command=on_pick_json,
+            ).pack(side="left", padx=(0, 8))
+
+            ctk.CTkButton(
+                top_actions,
+                text="Открыть Google Console ↗",
+                height=34,
+                corner_radius=10,
+                fg_color=THEME["bg_card"],
+                hover_color=THEME["bg_hover"],
+                text_color=THEME["text_main"],
+                font=ctk.CTkFont(size=12),
+                command=lambda: webbrowser.open("https://console.cloud.google.com/apis/credentials"),
+            ).pack(side="left")
+
+            cur_cfg = self.google_sync.config
+            cid_var = tk.StringVar(value=cur_cfg.client_id if cur_cfg else "")
+            csec_var = tk.StringVar(value=cur_cfg.client_secret if cur_cfg else "")
+
+            ctk.CTkLabel(body, text="Client ID", font=ctk.CTkFont(size=11, weight="bold"), text_color=THEME["text_muted"]).pack(anchor="w")
+            ctk.CTkEntry(
+                body,
+                textvariable=cid_var,
+                placeholder_text="1234567890-xxxx.apps.googleusercontent.com",
+                height=34,
+                corner_radius=10,
+                fg_color=THEME["bg_root"],
+                border_color=THEME["border"],
+                border_width=1,
+                text_color=THEME["text_main"],
+                placeholder_text_color=THEME["text_dim"],
+                font=ctk.CTkFont(size=12),
+            ).pack(fill="x", pady=(3, 8))
+
+            ctk.CTkLabel(body, text="Client Secret (если указан в Google Console)", font=ctk.CTkFont(size=11, weight="bold"), text_color=THEME["text_muted"]).pack(anchor="w")
+            ctk.CTkEntry(
+                body,
+                textvariable=csec_var,
+                placeholder_text="GOCSPX-...",
+                show="•",
+                height=34,
+                corner_radius=10,
+                fg_color=THEME["bg_root"],
+                border_color=THEME["border"],
+                border_width=1,
+                text_color=THEME["text_main"],
+                placeholder_text_color=THEME["text_dim"],
+                font=ctk.CTkFont(size=12),
+            ).pack(fill="x", pady=(3, 8))
+
+            ctk.CTkLabel(
+                body,
+                textvariable=status_var,
+                font=ctk.CTkFont(size=11),
+                text_color=THEME["err_red"],
+                wraplength=420,
+                justify="left",
+            ).pack(anchor="w", pady=(2, 8))
+
+            bottom_row = ctk.CTkFrame(body, fg_color="transparent")
+            bottom_row.pack(fill="x", side="bottom")
+
+            def on_save_manual():
+                cfg = GoogleOAuthConfig(client_id=cid_var.get().strip(), client_secret=csec_var.get().strip())
+                try:
+                    self.google_sync.set_config(cfg)
+                    status_var.set("")
+                    render_waiting_view()
+                except GoogleAuthError as exc:
+                    status_var.set(str(exc))
+
+            ctk.CTkButton(
+                bottom_row,
+                text="Сохранить и войти через Google",
+                height=36,
+                corner_radius=10,
+                fg_color=THEME["bg_card_alt"],
+                hover_color=THEME["bg_hover"],
+                text_color=THEME["text_main"],
+                font=ctk.CTkFont(size=12, weight="bold"),
+                command=on_save_manual,
+            ).pack(side="left")
+
+            ctk.CTkButton(
+                bottom_row,
+                text="Закрыть",
+                width=84,
+                height=36,
+                corner_radius=10,
+                fg_color="transparent",
+                hover_color=THEME["bg_hover"],
+                text_color=THEME["text_muted"],
+                font=ctk.CTkFont(size=12),
+                command=on_dialog_close,
+            ).pack(side="right")
+
+        self.google_sync.reload_config()
+        if not force_setup and self.google_sync.config and self.google_sync.config.is_valid:
+            render_waiting_view()
+        else:
+            render_setup_view()
 
     # ==========================================
     # КАРКАС ОКНА (SIDEBAR / CONTENT / BOTTOM BAR)
@@ -1322,6 +1760,18 @@ class AetherStreamingApp(ctk.CTk):
             btn.grid(row=idx, column=0, sticky="ew", padx=14, pady=3)
             self.nav_buttons[page_id] = btn
 
+        # Карточка аккаунта Google
+        self.account_box = ctk.CTkFrame(
+            self.sidebar,
+            fg_color=THEME["bg_card"],
+            corner_radius=12,
+            border_width=1,
+            border_color=THEME["border"],
+        )
+        self.account_box.grid(row=6, column=0, sticky="ew", padx=14, pady=(8, 4))
+        self.account_box.grid_columnconfigure(0, weight=1)
+        self._refresh_sidebar_account_box()
+
         # Индикатор аудио-активности + профиль вкуса внизу сайдбара
         self.taste_summary_box = ctk.CTkFrame(
             self.sidebar,
@@ -1330,7 +1780,7 @@ class AetherStreamingApp(ctk.CTk):
             border_width=1,
             border_color=THEME["border"],
         )
-        self.taste_summary_box.grid(row=6, column=0, sticky="ew", padx=14, pady=(8, 16))
+        self.taste_summary_box.grid(row=7, column=0, sticky="ew", padx=14, pady=(4, 16))
         self.taste_summary_box.grid_columnconfigure(0, weight=1)
         self._refresh_sidebar_taste_box()
 
@@ -1615,38 +2065,142 @@ class AetherStreamingApp(ctk.CTk):
 
         self._sync_nav_buttons()
 
+    def _refresh_sidebar_account_box(self):
+        if not hasattr(self, "account_box"):
+            return
+        for w in self.account_box.winfo_children():
+            w.destroy()
+
+        sess = self.google_sync.session
+        if sess is None:
+            ctk.CTkLabel(
+                self.account_box,
+                text="Аккаунт Google",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=THEME["text_main"],
+            ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+
+            ctk.CTkLabel(
+                self.account_box,
+                text="Сохраняйте лайки и волну в облаке",
+                font=ctk.CTkFont(size=10),
+                text_color=THEME["text_dim"],
+                wraplength=192,
+                justify="left",
+                anchor="w",
+            ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 8))
+
+            ctk.CTkButton(
+                self.account_box,
+                text="G   Войти через Google",
+                height=30,
+                corner_radius=8,
+                fg_color=THEME["bg_card_alt"],
+                hover_color=THEME["bg_hover"],
+                text_color=THEME["text_main"],
+                border_width=1,
+                border_color=THEME["border"],
+                font=ctk.CTkFont(size=11, weight="bold"),
+                command=self._open_google_auth_dialog,
+            ).grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+            return
+
+        if sess.picture and sess.picture != self._google_avatar_url:
+            self._load_google_avatar_async(sess.picture)
+
+        top = ctk.CTkFrame(self.account_box, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        top.grid_columnconfigure(1, weight=1)
+
+        if self._google_avatar_img is not None:
+            avatar_lbl = ctk.CTkLabel(top, text="", image=self._google_avatar_img)
+            avatar_lbl.grid(row=0, column=0, rowspan=2, padx=(0, 8))
+        else:
+            initial = (sess.name[:1] or sess.email[:1] or "G").upper()
+            ctk.CTkLabel(
+                top,
+                text=initial,
+                width=32,
+                height=32,
+                corner_radius=16,
+                fg_color=self.accent_soft,
+                text_color=self.accent_color,
+                font=ctk.CTkFont(size=13, weight="bold"),
+            ).grid(row=0, column=0, rowspan=2, padx=(0, 8))
+
+        short_name = sess.name if len(sess.name) <= 18 else sess.name[:16] + "…"
+        short_email = sess.email if len(sess.email) <= 22 else sess.email[:20] + "…"
+        ctk.CTkLabel(
+            top,
+            text=short_name,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=THEME["text_main"],
+            anchor="w",
+        ).grid(row=0, column=1, sticky="w")
+        ctk.CTkLabel(
+            top,
+            text=short_email,
+            font=ctk.CTkFont(size=10),
+            text_color=THEME["text_dim"],
+            anchor="w",
+        ).grid(row=1, column=1, sticky="w")
+
+        status_text = self.google_sync_status or "Синхронизировано"
+        status_color = (
+            self.accent_color
+            if self.google_syncing
+            else (THEME["ok_green"] if status_text == "Синхронизировано" else THEME["err_red"])
+        )
+        ctk.CTkLabel(
+            self.account_box,
+            text=status_text,
+            font=ctk.CTkFont(size=10),
+            text_color=status_color,
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+
+        actions = ctk.CTkFrame(self.account_box, fg_color="transparent")
+        actions.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        actions.grid_columnconfigure(0, weight=1)
+        actions.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkButton(
+            actions,
+            text="↻ Синхр.",
+            height=24,
+            corner_radius=7,
+            fg_color=THEME["bg_root"],
+            hover_color=THEME["bg_hover"],
+            text_color=THEME["text_muted"],
+            font=ctk.CTkFont(size=10),
+            state="disabled" if self.google_syncing else "normal",
+            command=lambda: self._sync_google_cloud_async(pull_first=True),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        ctk.CTkButton(
+            actions,
+            text="Выйти",
+            height=24,
+            corner_radius=7,
+            fg_color=THEME["bg_root"],
+            hover_color=THEME["bg_hover"],
+            text_color=THEME["text_dim"],
+            font=ctk.CTkFont(size=10),
+            command=self._sign_out_google,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
     def _refresh_sidebar_taste_box(self):
         if not hasattr(self, "taste_summary_box"):
             return
         for w in self.taste_summary_box.winfo_children():
             w.destroy()
 
-        row_idx = 0
-        if self.channel_url:
-            status_txt = "Синхронизация…" if self.channel_syncing else f"Канал: {self.channel_handle}"
-            ctk.CTkLabel(
-                self.taste_summary_box,
-                text=status_txt,
-                font=ctk.CTkFont(size=11, weight="bold"),
-                text_color=self.accent_color,
-            ).grid(row=row_idx, column=0, sticky="w", padx=12, pady=(10, 2))
-            row_idx += 1
-
-            ctk.CTkLabel(
-                self.taste_summary_box,
-                text=f"Треков из канала: {len(self.channel_tracks)}",
-                font=ctk.CTkFont(size=10),
-                text_color=THEME["text_muted"],
-            ).grid(row=row_idx, column=0, sticky="w", padx=12, pady=(0, 6))
-            row_idx += 1
-
         ctk.CTkLabel(
             self.taste_summary_box,
             text="Профиль вкуса",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=THEME["text_muted"],
-        ).grid(row=row_idx, column=0, sticky="w", padx=12, pady=(8 if row_idx == 0 else 2, 3))
-        row_idx += 1
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 3))
 
         seeds = self.custom_seeds + [a for a in self._get_top_taste_artists(4) if a not in self.custom_seeds]
         if seeds:
@@ -1654,7 +2208,7 @@ class AetherStreamingApp(ctk.CTk):
             if len(summary_txt) > 56:
                 summary_txt = summary_txt[:53] + "…"
         else:
-            summary_txt = "Укажите свой YouTube-канал или ставьте ♥"
+            summary_txt = "Добавьте любимых артистов или ставьте ♥"
 
         ctk.CTkLabel(
             self.taste_summary_box,
@@ -1664,8 +2218,7 @@ class AetherStreamingApp(ctk.CTk):
             wraplength=192,
             justify="left",
             anchor="w",
-        ).grid(row=row_idx, column=0, sticky="w", padx=12, pady=(0, 8))
-        row_idx += 1
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 8))
 
         # Компактный переключатель нормализации громкости
         norm_txt = "Нормализация: ВКЛ" if self.engine.normalize_audio else "Нормализация: ВЫКЛ"
@@ -1679,7 +2232,7 @@ class AetherStreamingApp(ctk.CTk):
             text_color=self.accent_color if self.engine.normalize_audio else THEME["text_dim"],
             font=ctk.CTkFont(size=10, weight="bold" if self.engine.normalize_audio else "normal"),
             command=self._toggle_normalize,
-        ).grid(row=row_idx, column=0, sticky="ew", padx=10, pady=(0, 10))
+        ).grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
 
     # ==========================================
     # НАВИГАЦИЯ И РЕАКТИВНЫЕ ОБНОВЛЕНИЯ СТРОК
@@ -1773,9 +2326,7 @@ class AetherStreamingApp(ctk.CTk):
         try:
             if not self._wave_status_lbl.winfo_exists():
                 return
-            if self.channel_syncing:
-                self._wave_status_lbl.configure(text="Синхронизация канала…", text_color=self.accent_color)
-            elif self.wave_fetching:
+            if self.wave_fetching:
                 self._wave_status_lbl.configure(text="Подбираем под ваш вкус…", text_color=self.accent_color)
             else:
                 self._wave_status_lbl.configure(text=f"{len(self.wave_queue)} треков в потоке", text_color=THEME["text_dim"])
@@ -1819,7 +2370,7 @@ class AetherStreamingApp(ctk.CTk):
         if top_artists:
             sub_info = f"Настроено под вас: {', '.join(top_artists[:3])}  •  {self.wave_mood}"
         else:
-            sub_info = "Подключите свой YouTube-канал или укажите любимых артистов"
+            sub_info = "Укажите любимых артистов или ставьте ♥ понравившимся трекам"
 
         ctk.CTkLabel(
             title_col,
@@ -1887,86 +2438,7 @@ class AetherStreamingApp(ctk.CTk):
                 command=lambda val=m: self._set_wave_mood(val),
             ).pack(side="left", padx=3)
 
-        # Ряд 2: YouTube-канал / публичный плейлист
-        yt_row = ctk.CTkFrame(tuning_box, fg_color="transparent")
-        yt_row.pack(fill="x", pady=(0, 9))
-        ctk.CTkLabel(
-            yt_row, text="Мой YouTube:", font=ctk.CTkFont(size=12), text_color=THEME["text_dim"], width=94, anchor="w"
-        ).pack(side="left")
-
-        if self.channel_url:
-            badge_w = max(145, len(self.channel_handle) * 8 + 50)
-            ctk.CTkButton(
-                yt_row,
-                text=f"✓ {self.channel_handle} ({len(self.channel_tracks)} треков)",
-                width=badge_w,
-                height=28,
-                corner_radius=14,
-                fg_color=self.accent_soft,
-                hover_color=THEME["bg_hover"],
-                text_color=self.accent_color,
-                font=ctk.CTkFont(size=11, weight="bold"),
-                command=self._open_channel_tab,
-            ).pack(side="left", padx=(3, 6))
-
-            ctk.CTkButton(
-                yt_row,
-                text="Обновить",
-                width=78,
-                height=28,
-                corner_radius=14,
-                fg_color=THEME["bg_card"],
-                hover_color=THEME["bg_hover"],
-                text_color=THEME["text_main"],
-                font=ctk.CTkFont(size=11),
-                command=lambda: self._sync_youtube_channel(refresh_wave_after=True),
-            ).pack(side="left", padx=(0, 6))
-
-            ctk.CTkButton(
-                yt_row,
-                text="Отвязать",
-                width=74,
-                height=28,
-                corner_radius=14,
-                fg_color="transparent",
-                hover_color=THEME["bg_hover"],
-                text_color=THEME["text_dim"],
-                font=ctk.CTkFont(size=11),
-                command=self._disconnect_youtube_channel,
-            ).pack(side="left")
-        else:
-            self.channel_entry_var = tk.StringVar()
-            ch_entry = ctk.CTkEntry(
-                yt_row,
-                textvariable=self.channel_entry_var,
-                placeholder_text="@ник_канала или ссылка на публичный плейлист YouTube...",
-                width=355,
-                height=30,
-                corner_radius=15,
-                fg_color=THEME["bg_root"],
-                border_color=THEME["border"],
-                border_width=1,
-                text_color=THEME["text_main"],
-                placeholder_text_color=THEME["text_dim"],
-                font=ctk.CTkFont(size=12),
-            )
-            ch_entry.pack(side="left", padx=(3, 6))
-            ch_entry.bind("<Return>", lambda _e: self._connect_youtube_channel(self.channel_entry_var.get()))
-
-            ctk.CTkButton(
-                yt_row,
-                text="Подключить",
-                width=96,
-                height=30,
-                corner_radius=15,
-                fg_color=THEME["bg_card"],
-                hover_color=THEME["bg_hover"],
-                text_color=THEME["text_main"],
-                font=ctk.CTkFont(size=11, weight="bold"),
-                command=lambda: self._connect_youtube_channel(self.channel_entry_var.get()),
-            ).pack(side="left")
-
-        # Ряд 3: Ориентиры вкуса
+        # Ряд 2: Ориентиры вкуса
         seeds_row = ctk.CTkFrame(tuning_box, fg_color="transparent")
         seeds_row.pack(fill="x")
         ctk.CTkLabel(
@@ -2099,24 +2571,24 @@ class AetherStreamingApp(ctk.CTk):
         self._wave_rendered_count = len(self.wave_queue)
         self._update_wave_status_label()
 
-    def _open_channel_tab(self):
-        self.library_subtab = "channel"
-        self._switch_page("library")
-
     def _add_custom_seed(self):
         val = self.seed_entry_var.get().strip()
         if not val:
             return
         self.seed_entry_var.set("")
+        now = time.time()
         if not any(s.lower() == val.lower() for s in self.custom_seeds):
             self.custom_seeds.insert(0, val)
             self.custom_seeds = self.custom_seeds[:10]
+        self.custom_seed_timestamps[val.lower()] = now
+        self.removed_seed_timestamps.pop(val.lower(), None)
         self._adjust_artist_score(val, 4.0, save=True)
         self._refresh_sidebar_taste_box()
         self._refresh_wave()
 
     def _remove_custom_seed(self, val: str):
         self.custom_seeds = [s for s in self.custom_seeds if s != val]
+        self.removed_seed_timestamps[val.lower()] = time.time()
         self._save_user_state()
         self._refresh_sidebar_taste_box()
         self._refresh_wave()
@@ -2124,6 +2596,8 @@ class AetherStreamingApp(ctk.CTk):
     def _promote_artist_seed(self, artist: str):
         if artist not in self.custom_seeds:
             self.custom_seeds.insert(0, artist)
+            self.custom_seed_timestamps[artist.lower()] = time.time()
+            self.removed_seed_timestamps.pop(artist.lower(), None)
             self._save_user_state()
             self._refresh_sidebar_taste_box()
             self._refresh_wave()
@@ -2223,7 +2697,7 @@ class AetherStreamingApp(ctk.CTk):
             self._build_track_row(scroll, idx, track, self.search_results, is_wave=False)
 
     # ==========================================
-    # СТРАНИЦА 3: КОЛЛЕКЦИЯ (ЛЮБИМЫЕ / КАНАЛ / ИСТОРИЯ / ФАЙЛЫ)
+    # СТРАНИЦА 3: КОЛЛЕКЦИЯ (ЛЮБИМЫЕ / ИСТОРИЯ / ФАЙЛЫ)
     # ==========================================
     def _render_library_page(self):
         container = ctk.CTkFrame(self.content_area, fg_color="transparent")
@@ -2264,7 +2738,6 @@ class AetherStreamingApp(ctk.CTk):
 
         subtabs = [
             ("liked", f"♥  Мне нравится ({len(self.liked_tracks)})"),
-            ("channel", f"📺  Канал ({len(self.channel_tracks)})"),
             ("history", f"🕘  Недавние ({len(self.history_tracks)})"),
             ("local", f"📁  Файлы ({len(self.local_tracks)})"),
         ]
@@ -2281,19 +2754,6 @@ class AetherStreamingApp(ctk.CTk):
                 font=ctk.CTkFont(size=12, weight="bold"),
                 command=lambda s=tab_id: self._switch_library_subtab(s),
             ).pack(side="left", padx=(0, 6))
-
-        if self.library_subtab == "channel" and self.channel_url:
-            ctk.CTkButton(
-                tabs_row,
-                text="↻ Обновить",
-                height=32,
-                corner_radius=10,
-                fg_color=THEME["bg_card"],
-                hover_color=THEME["bg_hover"],
-                text_color=THEME["text_main"],
-                font=ctk.CTkFont(size=12),
-                command=lambda: self._sync_youtube_channel(refresh_wave_after=False),
-            ).pack(side="right")
 
         if self.library_subtab == "local":
             ctk.CTkButton(
@@ -2344,13 +2804,6 @@ class AetherStreamingApp(ctk.CTk):
         if self.library_subtab == "liked":
             base_items = self.liked_tracks
             hint = "Ставьте ♥ понравившимся трекам — они появятся здесь и настроят Мою волну"
-        elif self.library_subtab == "channel":
-            base_items = self.channel_tracks
-            hint = (
-                "Синхронизация треков канала…"
-                if self.channel_syncing
-                else "Подключите свой @канал или публичный плейлист во вкладке «Моя волна»"
-            )
         elif self.library_subtab == "history":
             base_items = self.history_tracks
             hint = "Здесь появятся треки, которые вы слушали недавно"
@@ -2377,8 +2830,6 @@ class AetherStreamingApp(ctk.CTk):
 
     def _switch_library_subtab(self, sub: str):
         self.library_subtab = sub
-        if sub == "channel" and self.channel_tracks:
-            self._prefetch_batch(self.channel_tracks[:4])
         self._render_page()
 
     # ==========================================
@@ -2649,7 +3100,7 @@ class AetherStreamingApp(ctk.CTk):
     def _choose_wave_strategy(self) -> tuple[str, str]:
         mood_mod = self.MOOD_MODIFIERS.get(self.wave_mood, "")
 
-        # 1. YouTube Radio (RD{vid}) по треку из канала / лайков
+        # 1. YouTube Radio (RD{vid}) по треку из лайков и истории
         if self.seed_videos and self.wave_mood == "Любое" and random.random() < 0.62:
             seed = random.choice(self.seed_videos[-22:])
             vid = seed.get("vid")
@@ -2726,26 +3177,6 @@ class AetherStreamingApp(ctk.CTk):
                         candidates.append(item)
             except Exception:
                 pass
-
-            # Подмешиваем трек с привязанного канала
-            if self.channel_tracks and random.random() < 0.55:
-                ch_pool = [
-                    t for t in self.channel_tracks
-                    if t.uid not in existing_uids and (not t.signature or t.signature not in existing_sigs)
-                ]
-                if ch_pool:
-                    pick = random.choice(ch_pool)
-                    copy_item = TrackItem(
-                        title=pick.title,
-                        artist=pick.artist,
-                        duration=pick.duration,
-                        webpage_url=pick.webpage_url,
-                        thumbnail_url=pick.thumbnail_url,
-                        reason=f"Из канала {self.channel_handle}",
-                    )
-                    copy_item.stream_url = pick.stream_url
-                    copy_item.stream_resolved_at = pick.stream_resolved_at
-                    candidates.insert(0, copy_item)
 
             candidates.sort(key=self._score_wave_candidate, reverse=True)
             ordered: list[TrackItem] = []
@@ -3232,6 +3663,8 @@ class AetherStreamingApp(ctk.CTk):
             if track.is_online:
                 self._load_bar_cover_async(track)
 
+        self._update_tray_state()
+
     def _apply_accent(self, accent: str, soft: str):
         self.accent_color = accent
         self.accent_soft = soft
@@ -3259,12 +3692,16 @@ class AetherStreamingApp(ctk.CTk):
             self._toggle_like_track(self.current_track)
 
     def _toggle_like_track(self, track: TrackItem):
+        now = time.time()
         if self._is_liked(track):
             self.liked_tracks = [t for t in self.liked_tracks if t.uid != track.uid]
+            self.unliked_timestamps[track.uid] = now
             self._adjust_artist_score(track.artist, -2.5, save=True)
             liked = False
         else:
             self.liked_tracks.insert(0, track)
+            self.liked_timestamps[track.uid] = now
+            self.unliked_timestamps.pop(track.uid, None)
             self.disliked_uids.discard(track.uid)
             self._record_positive_seed(track, weight=4.0)
             liked = True
@@ -3276,6 +3713,7 @@ class AetherStreamingApp(ctk.CTk):
             )
 
         self._refresh_sidebar_taste_box()
+        self._update_tray_state()
 
         # Точечно обновляем сердечко без сброса скролла; перерисовываем только вкладку "Мне нравится"
         if self.current_page == "library" and self.library_subtab == "liked":
@@ -3288,6 +3726,8 @@ class AetherStreamingApp(ctk.CTk):
             return
         uid = self.current_track.uid
         self.disliked_uids.add(uid)
+        if self._is_liked(self.current_track):
+            self.unliked_timestamps[uid] = time.time()
         self.liked_tracks = [t for t in self.liked_tracks if t.uid != uid]
         self._adjust_artist_score(self.current_track.artist, -5.0, save=True)
         self._track_credited = True
@@ -3298,6 +3738,7 @@ class AetherStreamingApp(ctk.CTk):
         playing = self.engine.is_playing and not self.engine.is_paused
         self.play_btn.configure(text="⏸" if playing else "▶")
         self._sync_wave_hero_button()
+        self._update_tray_state()
 
     def _on_play_pause(self):
         if not self.engine.is_playing:
@@ -3470,6 +3911,7 @@ class AetherStreamingApp(ctk.CTk):
         self.bind("M", self._hk_mute)
         self.bind("l", self._hk_like)
         self.bind("L", self._hk_like)
+        self.bind("<Control-q>", lambda _e: self._quit_app())
 
     def _hk_space(self, _e):
         if not self._is_typing_in_input():
@@ -3517,6 +3959,12 @@ class AetherStreamingApp(ctk.CTk):
         if self._closing:
             return
 
+        is_visible = True
+        try:
+            is_visible = bool(self.winfo_viewable())
+        except Exception:
+            is_visible = True
+
         if self.engine.is_playing and not self.is_seeking:
             pos = self.engine.get_position()
             if self.current_track:
@@ -3525,29 +3973,68 @@ class AetherStreamingApp(ctk.CTk):
                     if not self._track_credited and pos >= self.current_track.duration * 0.65:
                         self._record_positive_seed(self.current_track, weight=1.8)
                         self._track_credited = True
-                elif pos > self.progress_slider.cget("to"):
+                elif is_visible and pos > self.progress_slider.cget("to"):
                     self.progress_slider.configure(to=pos + 30.0)
-            self.progress_slider.set(pos)
-            self.elapsed_label.configure(text=format_time(pos))
+            if is_visible:
+                self.progress_slider.set(pos)
+                self.elapsed_label.configure(text=format_time(pos))
 
-        # Обновляем 5-полосный минималистичный индикатор
-        bars = self.engine.spectrum_bars
-        playing_active = self.engine.is_playing and not self.engine.is_paused and not self.engine.muted
-        bar_color = self.accent_color if playing_active else THEME["text_dim"]
-        for i, rect in enumerate(self.meter_rects):
-            lvl = bars[i] if playing_active else 0.0
-            h = max(2, int(2 + lvl * 15))
-            x0 = i * 5 + 1
-            self.meter_canvas.coords(rect, x0, 18 - h, x0 + 3, 18)
-            self.meter_canvas.itemconfig(rect, fill=bar_color)
+        # Обновляем 5-полосный минималистичный индикатор только когда окно видимо
+        if is_visible:
+            bars = self.engine.spectrum_bars
+            playing_active = self.engine.is_playing and not self.engine.is_paused and not self.engine.muted
+            bar_color = self.accent_color if playing_active else THEME["text_dim"]
+            for i, rect in enumerate(self.meter_rects):
+                lvl = bars[i] if playing_active else 0.0
+                h = max(2, int(2 + lvl * 15))
+                x0 = i * 5 + 1
+                self.meter_canvas.coords(rect, x0, 18 - h, x0 + 3, 18)
+                self.meter_canvas.itemconfig(rect, fill=bar_color)
 
-        self.after(90, self._tick_loop)
+        self.after(90 if is_visible else 350, self._tick_loop)
 
-    def _on_close(self):
+    def _quit_app(self):
+        if self._closing:
+            return
         self._closing = True
-        self._save_user_state()
+
+        if self._active_oauth_flow is not None:
+            try:
+                self._active_oauth_flow.cancel()
+            except Exception:
+                pass
+            self._active_oauth_flow = None
+
+        if self._cloud_sync_timer is not None:
+            try:
+                self.after_cancel(self._cloud_sync_timer)
+            except Exception:
+                pass
+            self._cloud_sync_timer = None
+
+        self._save_user_state(sync_cloud=False)
+
+        if self.google_sync.is_signed_in and self._cloud_dirty:
+            snapshot = self._export_state_dict()
+
+            def final_push():
+                try:
+                    self.google_sync.push_profile(snapshot)
+                except Exception:
+                    pass
+
+            push_thread = threading.Thread(target=final_push, daemon=True, name="google-final-push")
+            push_thread.start()
+            push_thread.join(timeout=2.5)
+
+        try:
+            self.tray.stop()
+        except Exception:
+            pass
+
         self.engine.stop()
         self.cover_cache.shutdown()
+        self.google_sync.close()
         try:
             self.prefetch_pool.shutdown(wait=False, cancel_futures=True)
         except Exception:
