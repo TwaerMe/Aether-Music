@@ -26,6 +26,15 @@ from google_sync import (
     build_pkce_pair,
     merge_user_states,
 )
+from perf_core import (
+    AudioFileCache,
+    DebouncedStateWriter,
+    PCMStreamBuffer,
+    PriorityTrackResolver,
+    StreamURLCache,
+    parse_stream_expiry,
+    pick_optimal_thumbnail,
+)
 from tray_manager import TrayManager
 
 
@@ -295,7 +304,7 @@ class TestTrayAndMainAstIntegrity(unittest.TestCase):
         for forbidden_token in ("channel_url", "channel_handle", "channel_tracks", "channel_syncing"):
             self.assertNotIn(forbidden_token, src)
 
-        # New tray & Google sync handlers must exist
+        # New tray, Google sync & performance handlers must exist
         for required_fn in (
             "_on_window_close_request",
             "_restore_from_tray",
@@ -304,8 +313,267 @@ class TestTrayAndMainAstIntegrity(unittest.TestCase):
             "_sync_google_cloud_async",
             "_sign_out_google",
             "_refresh_sidebar_account_box",
+            "_render_rows_chunked",
+            "_schedule_keyboard_seek",
+            "_seek_current_track",
+            "_on_track_resolved_bg",
         ):
             self.assertIn(required_fn, func_names)
+
+        self.assertIn("from perf_core import", src)
+
+
+class _DummyTrack:
+    def __init__(self, uid: str):
+        self.uid = uid
+        self.stream_url = None
+        self.stream_resolved_at = 0.0
+
+
+class TestPerfCoreOptimizations(unittest.TestCase):
+    def test_parse_stream_expiry(self):
+        now = 1_700_000_000.0
+        url_with_exp = f"https://rr1---sn.googlevideo.com/videoplayback?expire={int(now + 10000)}&id=1"
+        exp = parse_stream_expiry(url_with_exp, now=now, safety_margin=500.0)
+        self.assertAlmostEqual(exp, now + 9500.0, delta=1.0)
+
+        url_no_exp = "https://example.com/audio.webm"
+        self.assertAlmostEqual(parse_stream_expiry(url_no_exp, now=now, default_ttl=3600.0), now + 3600.0, delta=1.0)
+        self.assertEqual(parse_stream_expiry(None, now=now), now)
+
+    def test_pick_optimal_thumbnail(self):
+        thumbs = [
+            {"url": "https://i.ytimg.com/vi/abc/default.jpg", "width": 120, "height": 90},
+            {"url": "https://i.ytimg.com/vi/abc/mqdefault.webp", "width": 320, "height": 180},
+            {"url": "https://i.ytimg.com/vi/abc/mqdefault.jpg", "width": 320, "height": 180},
+            {"url": "https://i.ytimg.com/vi/abc/maxresdefault.jpg", "width": 1280, "height": 720},
+        ]
+        chosen = pick_optimal_thumbnail(thumbs, video_id="abc")
+        self.assertEqual(chosen, "https://i.ytimg.com/vi/abc/mqdefault.jpg")
+        self.assertEqual(pick_optimal_thumbnail([], video_id="XYZ12345678"), "https://i.ytimg.com/vi/XYZ12345678/mqdefault.jpg")
+
+    def test_stream_url_cache_lru_expiry_and_persistence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "stream_cache.json")
+            now = time.time()
+            future_exp = int(now + 7200)
+            cache = StreamURLCache(cache_file=cache_path, max_items=32)
+
+            cache.put("yt:1", f"https://example.com/a?expire={future_exp}", duration=180.0, thumbnail_url="https://img/1.jpg", now=now)
+            hit = cache.get("yt:1", now=now)
+            self.assertIsNotNone(hit)
+            self.assertEqual(hit["duration"], 180.0)
+            self.assertEqual(hit["thumbnail_url"], "https://img/1.jpg")
+
+            # Expired query returns None
+            self.assertIsNone(cache.get("yt:1", now=now + 10000))
+
+            # Re-add, flush, and reload from disk
+            cache.put("yt:2", f"https://example.com/b?expire={future_exp}", duration=210.0, now=now)
+            cache.put("yt:3", f"https://example.com/c?expire={future_exp}", duration=120.0, now=now)
+            cache.invalidate("yt:3")
+            cache.close()
+
+            reloaded = StreamURLCache(cache_file=cache_path, max_items=32)
+            self.assertIsNotNone(reloaded.get("yt:2", now=now))
+            self.assertIsNone(reloaded.get("yt:3", now=now))
+            reloaded.close()
+
+    def test_audio_file_cache_hit_and_lru_eviction(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = AudioFileCache(cache_dir=tmpdir, max_bytes=10 * 1024 * 1024)
+            try:
+                # Tiny file (< 16KB) must be ignored
+                tiny_path = cache._path_for_uid("yt:tiny")
+                with open(tiny_path, "wb") as f:
+                    f.write(b"x" * 1024)
+                self.assertIsNone(cache.get_cached_path("yt:tiny"))
+
+                # Valid cached file (>= 16KB) returns path
+                ok_path = cache._path_for_uid("yt:ok")
+                with open(ok_path, "wb") as f:
+                    f.write(b"a" * 32768)
+                self.assertEqual(cache.get_cached_path("yt:ok"), ok_path)
+
+                # HLS playlist URLs must never be queued for single-file download
+                self.assertFalse(cache.warm_async("yt:hls", "https://example.com/live/index.m3u8"))
+
+                # Enforce size limit evicts oldest .aud files first
+                cache.max_bytes = 60000
+                p1 = cache._path_for_uid("yt:old1")
+                p2 = cache._path_for_uid("yt:old2")
+                p3 = cache._path_for_uid("yt:new3")
+                now = time.time()
+                for p, ts in ((p1, now - 300), (p2, now - 200), (p3, now + 50)):
+                    with open(p, "wb") as f:
+                        f.write(b"z" * 30000)
+                    os.utime(p, (ts, ts))
+                cache.enforce_size_limit()
+                self.assertFalse(os.path.exists(p1))
+                self.assertTrue(os.path.exists(p3))
+            finally:
+                cache.close()
+
+    def test_priority_resolver_preempts_and_deduplicates(self):
+        calls: list[str] = []
+        calls_lock = threading.Lock()
+        gate = threading.Event()
+        started_first = threading.Event()
+
+        def resolve_fn(track, force_refresh):
+            with calls_lock:
+                calls.append(track.uid)
+            if track.uid == "yt:blocker":
+                started_first.set()
+                gate.wait(timeout=2.0)
+            else:
+                time.sleep(0.03)
+            return f"https://stream/{track.uid}"
+
+        # 1 worker makes priority ordering deterministic
+        resolver = PriorityTrackResolver(resolve_fn=resolve_fn, num_workers=1)
+        try:
+            order: list[str] = []
+            done_urgent = threading.Event()
+            done_low = threading.Event()
+
+            resolver.submit(_DummyTrack("yt:blocker"), priority=PriorityTrackResolver.PRIORITY_PREFETCH)
+            self.assertTrue(started_first.wait(timeout=1.5))
+
+            resolver.submit(
+                _DummyTrack("yt:low"),
+                priority=PriorityTrackResolver.PRIORITY_PREFETCH,
+                on_done=lambda u: (order.append("low"), done_low.set()),
+            )
+            resolver.submit(
+                _DummyTrack("yt:urgent"),
+                priority=PriorityTrackResolver.PRIORITY_URGENT,
+                on_done=lambda u: (order.append("urgent"), done_urgent.set()),
+            )
+            gate.set()
+
+            self.assertTrue(done_urgent.wait(timeout=2.0))
+            self.assertTrue(done_low.wait(timeout=2.0))
+            self.assertEqual(order, ["urgent", "low"])
+        finally:
+            resolver.close()
+
+        # Deduplication across 2 workers for two different Track objects with the same uid
+        dedup_calls = 0
+        dedup_lock = threading.Lock()
+
+        def slow_resolve(track, force_refresh):
+            nonlocal dedup_calls
+            with dedup_lock:
+                dedup_calls += 1
+            time.sleep(0.08)
+            return f"https://stream/{track.uid}"
+
+        resolver2 = PriorityTrackResolver(resolve_fn=slow_resolve, num_workers=2)
+        try:
+            results: list[str | None] = []
+            ev1 = threading.Event()
+            ev2 = threading.Event()
+            t_a = _DummyTrack("yt:same")
+            t_b = _DummyTrack("yt:same")
+            resolver2.submit(t_a, priority=PriorityTrackResolver.PRIORITY_URGENT, on_done=lambda u: (results.append(u), ev1.set()))
+            resolver2.submit(t_b, priority=PriorityTrackResolver.PRIORITY_NEXT, on_done=lambda u: (results.append(u), ev2.set()))
+            self.assertTrue(ev1.wait(timeout=2.0))
+            self.assertTrue(ev2.wait(timeout=2.0))
+            self.assertEqual(dedup_calls, 1)
+            self.assertEqual(results, ["https://stream/yt:same", "https://stream/yt:same"])
+        finally:
+            resolver2.close()
+
+    def test_debounced_state_writer_coalesces_writes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fp = os.path.join(tmpdir, "state.json")
+            writer = DebouncedStateWriter(delay_sec=0.2)
+            try:
+                writer.schedule([(fp, {"v": 1})])
+                writer.schedule([(fp, {"v": 2})])
+                writer.schedule([(fp, {"v": 3})])
+                writer.flush_sync()
+                with open(fp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.assertEqual(data, {"v": 3})
+            finally:
+                writer.close()
+
+    def test_pcm_stream_buffer_fifo_eof_and_close(self):
+        buf = PCMStreamBuffer(max_chunks=4)
+        self.assertTrue(buf.put_chunk(b"1111"))
+        self.assertTrue(buf.put_chunk(b"2222"))
+        buf.mark_eof()
+
+        self.assertEqual(buf.get_chunk(timeout=0.5), (True, b"1111"))
+        self.assertEqual(buf.get_chunk(timeout=0.5), (True, b"2222"))
+        self.assertEqual(buf.get_chunk(timeout=0.5), (True, None))
+
+        buf.close()
+        self.assertFalse(buf.put_chunk(b"3333"))
+
+    def test_tray_update_state_deduplicates_redraws(self):
+        tray = TrayManager(
+            on_open=lambda: None,
+            on_play_pause=lambda: None,
+            on_next=lambda: None,
+            on_prev=lambda: None,
+            on_toggle_like=lambda: None,
+            on_quit=lambda: None,
+            get_play_state=lambda: True,
+            get_liked_state=lambda: False,
+        )
+
+        class _FakeIcon:
+            def __init__(self):
+                self.title = ""
+                self.updates = 0
+
+            def update_menu(self):
+                self.updates += 1
+
+        fake = _FakeIcon()
+        tray._icon = fake
+        tray._running = True
+
+        tray.update_state("Song A", "Artist A")
+        tray.update_state("Song A", "Artist A")
+        self.assertEqual(fake.updates, 1)
+
+        tray.update_state("Song B", "Artist B")
+        self.assertEqual(fake.updates, 2)
+
+    def test_google_sign_out_revokes_token_non_blocking(self):
+        revoke_started = threading.Event()
+        release_revoke = threading.Event()
+
+        def slow_revoke(method, url, params=None, headers=None, data=None):
+            revoke_started.set()
+            release_revoke.wait(timeout=2.0)
+            return _SimpleHttpResponse(200, b"")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = GoogleCloudSyncClient(tmpdir, transport=FakeTransport(slow_revoke))
+            client.set_session(
+                GoogleAccountSession(
+                    sub="sub-9",
+                    email="fast@gmail.com",
+                    name="Fast",
+                    picture="",
+                    access_token="tok-1",
+                    refresh_token="ref-1",
+                    expires_at=time.time() + 3600,
+                )
+            )
+            t0 = time.monotonic()
+            client.sign_out()
+            elapsed = time.monotonic() - t0
+            # Must return immediately instead of blocking on network I/O
+            self.assertLess(elapsed, 0.35)
+            self.assertFalse(client.is_signed_in)
+            self.assertTrue(revoke_started.wait(timeout=1.0))
+            release_revoke.set()
 
 
 if __name__ == "__main__":

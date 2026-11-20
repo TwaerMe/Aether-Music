@@ -34,6 +34,15 @@ from google_sync import (
     GoogleOAuthLoopbackFlow,
     merge_user_states,
 )
+from perf_core import (
+    AudioFileCache,
+    DebouncedStateWriter,
+    PCMStreamBuffer,
+    PriorityTrackResolver,
+    StreamURLCache,
+    parse_stream_expiry,
+    pick_optimal_thumbnail,
+)
 from tray_manager import TrayManager, create_app_icon_image
 
 # ==========================================
@@ -70,23 +79,30 @@ ctk.set_appearance_mode("dark")
 
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".aether_player")
 COVER_CACHE_DIR = os.path.join(APP_DATA_DIR, "covers")
+AUDIO_CACHE_DIR = os.path.join(APP_DATA_DIR, "audio_cache")
+STREAM_CACHE_FILE = os.path.join(APP_DATA_DIR, "stream_cache.json")
 STATE_FILE = os.path.join(APP_DATA_DIR, "user_state.json")
 DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Music", "Aether")
 
-# Надежные опции yt-dlp без конфликта ios + skip:hls
+# Ускоренные опции yt-dlp: сначала быстрые клиенты без тяжелого JS-дешифратора web и без DASH/HLS манифестов
 YDL_FAST_EXTRACT_OPTS = {
     "quiet": True,
     "no_warnings": True,
     "ignoreerrors": True,
     "nocheckcertificate": True,
     "no_check_formats": True,
-    "format": "bestaudio[ext=m4a][protocol^=http]/bestaudio[acodec=opus][protocol^=http]/bestaudio/best",
+    "skip_download": True,
+    "youtube_include_dash_manifest": False,
+    "youtube_include_hls_manifest": False,
+    "format": "bestaudio[ext=m4a][protocol^=http]/bestaudio[acodec=opus][protocol^=http]/bestaudio[protocol^=http]/bestaudio/best",
     "noplaylist": True,
-    "socket_timeout": 12,
+    "socket_timeout": 7,
+    "retries": 1,
+    "extractor_retries": 1,
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"],
-            "skip": ["translated_subs"],
+            "player_client": ["android_vr", "android", "tv"],
+            "skip": ["translated_subs", "dash", "hls"],
         }
     },
 }
@@ -96,25 +112,48 @@ YDL_FALLBACK_EXTRACT_OPTS = {
     "no_warnings": True,
     "ignoreerrors": True,
     "nocheckcertificate": True,
+    "no_check_formats": True,
+    "skip_download": True,
     "format": "bestaudio/best",
     "noplaylist": True,
-    "socket_timeout": 15,
+    "socket_timeout": 12,
+    "retries": 1,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["ios", "web"],
+            "skip": ["translated_subs"],
+        }
+    },
 }
 
 YDL_FAST_SEARCH_OPTS = {
     "quiet": True,
     "no_warnings": True,
     "ignoreerrors": True,
-    "extract_flat": True,
+    "extract_flat": "in_playlist",
+    "lazy_playlist": True,
     "skip_download": True,
+    "no_check_formats": True,
     "nocheckcertificate": True,
-    "socket_timeout": 12,
+    "socket_timeout": 8,
+    "retries": 1,
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"],
+            "player_client": ["android_vr", "android", "web"],
+            "skip": ["translated_subs"],
         }
     },
 }
+
+# Предкомпилированные регулярные выражения для горячих путей
+_VIDEO_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/)([0-9A-Za-z_-]{11})")
+_ARTIST_TOPIC_RE = re.compile(r"\s*-\s*Topic$", flags=re.IGNORECASE)
+_ARTIST_SUFFIX_RE = re.compile(r"\s*(Official|VEVO|Music)$", flags=re.IGNORECASE)
+_SIG_PARENS_RE = re.compile(
+    r"[\(\[\{].*?(official|video|audio|lyrics|lyric|hd|4k|mv|клип|премьера|музыка|live|visualizer).*?[\)\]\}]",
+    flags=re.IGNORECASE,
+)
+_SIG_NONWORD_RE = re.compile(r"[^a-zа-яё0-9]+")
 
 
 # ==========================================
@@ -132,21 +171,16 @@ def format_time(seconds: float) -> str:
 def clean_artist_name(artist: str) -> str:
     if not artist:
         return ""
-    cleaned = re.sub(r"\s*-\s*Topic$", "", artist, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*(Official|VEVO|Music)$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = _ARTIST_TOPIC_RE.sub("", artist)
+    cleaned = _ARTIST_SUFFIX_RE.sub("", cleaned)
     return cleaned.strip()
 
 
 def normalize_track_signature(title: str, artist: str = "") -> str:
     """Нормализует название для защиты от дублей одной песни с разных каналов."""
     text = f"{artist} {title}".lower()
-    text = re.sub(
-        r"[\(\[\{].*?(official|video|audio|lyrics|lyric|hd|4k|mv|клип|премьера|музыка|live|visualizer).*?[\)\]\}]",
-        " ",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(r"[^a-zа-яё0-9]+", " ", text)
+    text = _SIG_PARENS_RE.sub(" ", text)
+    text = _SIG_NONWORD_RE.sub(" ", text)
     tokens = [t for t in text.split() if len(t) > 1]
     return " ".join(tokens[:6])
 
@@ -154,7 +188,7 @@ def normalize_track_signature(title: str, artist: str = "") -> str:
 def extract_video_id(url: str | None) -> str | None:
     if not url:
         return None
-    m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/)([0-9A-Za-z_-]{11})", url)
+    m = _VIDEO_ID_RE.search(url)
     return m.group(1) if m else None
 
 
@@ -278,22 +312,73 @@ def set_windows_app_id():
 # ==========================================
 # LRU-КЭШ ИЗОБРАЖЕНИЙ + ПУЛ HTTP-СЕССИЙ
 # ==========================================
+def _extract_embedded_cover_pil(filepath: str) -> Image.Image | None:
+    """Лениво извлекает и сразу уменьшает встроенную обложку локального аудиофайла (в фоновом потоке)."""
+    try:
+        audio = MutagenFile(filepath)
+        if audio is None:
+            return None
+        raw_bytes = None
+        if audio.tags:
+            for tag in audio.tags.values():
+                if isinstance(tag, APIC) and getattr(tag, "data", None):
+                    raw_bytes = tag.data
+                    break
+        if raw_bytes is None and hasattr(audio, "pictures") and audio.pictures:
+            raw_bytes = audio.pictures[0].data
+        if not raw_bytes:
+            return None
+        with Image.open(io.BytesIO(raw_bytes)) as im:
+            im = im.convert("RGB")
+            im.thumbnail((200, 200), Image.Resampling.BILINEAR)
+            return im.copy()
+    except Exception:
+        return None
+
+
 class CoverCacheManager:
-    def __init__(self, max_mem_items: int = 160):
+    def __init__(self, max_mem_items: int = 220, max_pil_items: int = 120):
         self.max_mem_items = max_mem_items
+        self.max_pil_items = max_pil_items
         self._mem_cache: OrderedDict[str, ctk.CTkImage] = OrderedDict()
+        self._pil_cache: OrderedDict[str, Image.Image] = OrderedDict()
+        self._accent_cache: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._inflight: dict[str, list] = {}
         self._lock = threading.Lock()
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cover")
 
         self._session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=1)
+        adapter = HTTPAdapter(pool_connections=12, pool_maxsize=12, max_retries=1)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
-        self._session.headers.update({"User-Agent": "AetherMusic/2.0"})
+        self._session.headers.update({"User-Agent": "AetherMusic/2.2"})
 
         try:
             os.makedirs(COVER_CACHE_DIR, exist_ok=True)
+        except Exception:
+            pass
+        # Фоновая очистка кэша обложек, чтобы папка не разрасталась бесконечно
+        self._pool.submit(self._prune_disk_cache)
+
+    def _prune_disk_cache(self, max_files: int = 450):
+        try:
+            entries = []
+            for name in os.listdir(COVER_CACHE_DIR):
+                if not name.endswith(".jpg"):
+                    continue
+                fp = os.path.join(COVER_CACHE_DIR, name)
+                try:
+                    entries.append((os.path.getmtime(fp), fp))
+                except OSError:
+                    continue
+            if len(entries) <= max_files:
+                return
+            entries.sort(key=lambda x: x[0])
+            for _mt, fp in entries[: len(entries) - int(max_files * 0.8)]:
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
         except Exception:
             pass
 
@@ -309,12 +394,49 @@ class CoverCacheManager:
         while len(self._mem_cache) > self.max_mem_items:
             self._mem_cache.popitem(last=False)
 
+    def get_accent(self, uid: str) -> tuple[str, str] | None:
+        val = self._accent_cache.get(uid)
+        if val is not None:
+            self._accent_cache.move_to_end(uid)
+        return val
+
+    def put_accent(self, uid: str, accent: str, soft: str):
+        self._accent_cache[uid] = (accent, soft)
+        self._accent_cache.move_to_end(uid)
+        while len(self._accent_cache) > 220:
+            self._accent_cache.popitem(last=False)
+
+    def _get_pil_cached(self, source_key: str) -> Image.Image | None:
+        with self._lock:
+            im = self._pil_cache.get(source_key)
+            if im is not None:
+                self._pil_cache.move_to_end(source_key)
+            return im
+
+    def _put_pil_cached(self, source_key: str, pil_img: Image.Image):
+        with self._lock:
+            self._pil_cache[source_key] = pil_img
+            self._pil_cache.move_to_end(source_key)
+            while len(self._pil_cache) > self.max_pil_items:
+                self._pil_cache.popitem(last=False)
+
     def _disk_path(self, url: str) -> str:
         digest = hashlib.sha1(url.encode("utf-8", errors="ignore")).hexdigest()
         return os.path.join(COVER_CACHE_DIR, f"{digest}.jpg")
 
+    def _downscale_rgb(self, im: Image.Image) -> Image.Image:
+        rgb = im.convert("RGB")
+        if rgb.width > 200 or rgb.height > 200:
+            rgb.thumbnail((200, 200), Image.Resampling.BILINEAR)
+        return rgb
+
     def fetch_pil_async(self, url: str, callback):
-        """Скачивает (или берет с диска) PIL.Image через общий пул и вызывает callback(pil_img)."""
+        """Скачивает (или берет из RAM/диска) компактный PIL.Image (<=200px) через общий пул."""
+        cached = self._get_pil_cached(url)
+        if cached is not None:
+            self._pool.submit(callback, cached)
+            return
+
         with self._lock:
             if url in self._inflight:
                 self._inflight[url].append(callback)
@@ -327,24 +449,56 @@ class CoverCacheManager:
             try:
                 if os.path.exists(dpath):
                     with Image.open(dpath) as im:
-                        pil_img = im.convert("RGB")
+                        pil_img = self._downscale_rgb(im)
                 else:
-                    resp = self._session.get(url, timeout=6)
+                    resp = self._session.get(url, timeout=5)
                     if resp.status_code == 200 and resp.content:
                         with Image.open(io.BytesIO(resp.content)) as im:
-                            pil_img = im.convert("RGB")
+                            pil_img = self._downscale_rgb(im)
                         try:
-                            tmp = dpath + ".tmp"
-                            pil_img.save(tmp, format="JPEG", quality=85)
+                            tmp = f"{dpath}.{threading.get_ident()}.tmp"
+                            pil_img.save(tmp, format="JPEG", quality=82, optimize=False)
                             os.replace(tmp, dpath)
                         except Exception:
                             pass
             except Exception:
                 pil_img = None
 
+            if pil_img is not None:
+                self._put_pil_cached(url, pil_img)
+
             with self._lock:
                 cbs = self._inflight.pop(url, [])
 
+            if pil_img is not None:
+                for cb in cbs:
+                    try:
+                        cb(pil_img)
+                    except Exception:
+                        pass
+
+        self._pool.submit(worker)
+
+    def fetch_local_cover_async(self, filepath: str, callback):
+        """Лениво читает встроенную обложку локального файла в фоновом пуле."""
+        key = f"file:{filepath}"
+        cached = self._get_pil_cached(key)
+        if cached is not None:
+            self._pool.submit(callback, cached)
+            return
+
+        with self._lock:
+            if key in self._inflight:
+                self._inflight[key].append(callback)
+                return
+            self._inflight[key] = [callback]
+
+        def worker():
+            pil_img = _extract_embedded_cover_pil(filepath)
+            if pil_img is not None:
+                self._put_pil_cached(key, pil_img)
+            with self._lock:
+                cbs = self._inflight.pop(key, [])
             if pil_img is not None:
                 for cb in cbs:
                     try:
@@ -388,7 +542,16 @@ class TrackItem:
 
         self.stream_url: str | None = None
         self.stream_resolved_at: float = 0.0
+        self.stream_expires_at: float = 0.0
         self.cover_pil: Image.Image | None = None
+
+        # Кэшируем вычисляемые ключи один раз — ноль regex-вызовов в циклах рендера и поиска
+        self._video_id: str | None = extract_video_id(self.webpage_url)
+        if self._video_id:
+            self._uid: str = f"yt:{self._video_id}"
+        else:
+            self._uid = self.webpage_url or self.filepath or f"{self.artist}:{self.title}"
+        self._signature: str = normalize_track_signature(self.title, self.artist)
 
         # Потокобезопасный резолв без гонок
         self._resolve_lock = threading.Lock()
@@ -396,18 +559,15 @@ class TrackItem:
 
     @property
     def uid(self) -> str:
-        vid = extract_video_id(self.webpage_url)
-        if vid:
-            return f"yt:{vid}"
-        return self.webpage_url or self.filepath or f"{self.artist}:{self.title}"
+        return self._uid
 
     @property
     def signature(self) -> str:
-        return normalize_track_signature(self.title, self.artist)
+        return self._signature
 
     @property
     def video_id(self) -> str | None:
-        return extract_video_id(self.webpage_url)
+        return self._video_id
 
     @property
     def is_online(self) -> bool:
@@ -415,11 +575,23 @@ class TrackItem:
 
     @property
     def has_fresh_stream(self) -> bool:
-        return bool(self.stream_url) and (time.time() - self.stream_resolved_at) < 5400
+        if not self.stream_url:
+            return False
+        now = time.time()
+        if self.stream_expires_at > 0.0:
+            return now < self.stream_expires_at
+        return (now - self.stream_resolved_at) < 5400.0
+
+    def set_stream(self, url: str, expires_at: float | None = None):
+        now = time.time()
+        self.stream_url = url
+        self.stream_resolved_at = now
+        self.stream_expires_at = expires_at if (expires_at and expires_at > now) else parse_stream_expiry(url, now=now)
 
     def invalidate_stream(self):
         self.stream_url = None
         self.stream_resolved_at = 0.0
+        self.stream_expires_at = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -453,7 +625,6 @@ class TrackItem:
         title = os.path.splitext(filename)[0]
         artist = "Локальный файл"
         duration = 0.0
-        cover_pil = None
 
         try:
             audio = MutagenFile(filepath)
@@ -469,26 +640,16 @@ class TrackItem:
                         artist = str(audio.tags["TPE1"].text[0])
                     elif "artist" in audio.tags:
                         artist = str(audio.tags["artist"][0])
-                    for tag in audio.tags.values():
-                        if isinstance(tag, APIC):
-                            with Image.open(io.BytesIO(tag.data)) as im:
-                                cover_pil = im.convert("RGB")
-                            break
-                    if cover_pil is None and hasattr(audio, "pictures") and audio.pictures:
-                        with Image.open(io.BytesIO(audio.pictures[0].data)) as im:
-                            cover_pil = im.convert("RGB")
         except Exception:
             pass
 
-        item = cls(
+        return cls(
             title=title,
             artist=artist,
             duration=duration,
             filepath=filepath,
             source_type="LOCAL",
         )
-        item.cover_pil = cover_pil
-        return item
 
 
 # ==========================================
@@ -507,13 +668,18 @@ class StreamAudioEngine:
         self.muted: bool = False
         self.eq_preset: str = "flat"
         self.normalize_audio: bool = False
+        self.spectrum_enabled: bool = True
 
         self.is_playing: bool = False
         self.is_paused: bool = False
         self.sample_rate: int = 44100
 
         self._lock = threading.Lock()
+        self._stream_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._out_stream: sd.RawOutputStream | None = None
         self._proc: subprocess.Popen | None = None
+        self._active_buf: PCMStreamBuffer | None = None
         self._stop_event = threading.Event()
         self._session_id: int = 0
 
@@ -524,7 +690,9 @@ class StreamAudioEngine:
         self._paused_at_pos: float = 0.0
         self._paused_detached: bool = False
 
-        # 5 полос для спокойного минималистичного индикатора уровня
+        # Предвычисленное окно Ханна и 5 полос индикатора уровня (ноль аллокаций на каждый чанк)
+        self._hann_512 = np.hanning(512).astype(np.float32)
+        self._spectrum_slices = ((1, 4), (4, 10), (10, 26), (26, 65), (65, 180))
         self.spectrum_bars: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0]
 
     def _build_af_string(self) -> str:
@@ -548,28 +716,74 @@ class StreamAudioEngine:
             if proc.poll() is None:
                 proc.terminate()
                 try:
-                    proc.wait(timeout=0.8)
+                    proc.wait(timeout=0.35)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                    try:
+                        proc.wait(timeout=0.2)
+                    except Exception:
+                        pass
         except Exception:
             pass
+
+    def _kill_proc_async(self, proc: subprocess.Popen | None):
+        """Убивает старый ffmpeg в фоновом потоке, чтобы переключение треков и перемотка не фризили UI."""
+        if not proc:
+            return
+        threading.Thread(target=self._kill_proc_safe, args=(proc,), daemon=True, name="ffmpeg-reaper").start()
+
+    def _acquire_output_stream(self) -> sd.RawOutputStream:
+        """Возвращает прогретый RawOutputStream (переоткрывает только при необходимости)."""
+        with self._stream_lock:
+            if self._out_stream is not None and not self._out_stream.closed:
+                try:
+                    if not self._out_stream.active:
+                        self._out_stream.start()
+                    return self._out_stream
+                except Exception:
+                    self._close_output_stream_locked()
+
+            stream = sd.RawOutputStream(
+                samplerate=self.sample_rate,
+                channels=2,
+                dtype="int16",
+                blocksize=2048,
+                latency="low",
+            )
+            stream.start()
+            self._out_stream = stream
+            return stream
+
+    def _close_output_stream_locked(self):
+        st = self._out_stream
+        self._out_stream = None
+        if st is not None:
+            try:
+                st.stop()
+            except Exception:
+                pass
+            try:
+                st.close()
+            except Exception:
+                pass
+
+    def _close_output_stream(self):
+        with self._stream_lock:
+            self._close_output_stream_locked()
 
     def play_source(self, source: str, start_sec: float = 0.0, expected_duration: float = 0.0):
         with self._lock:
             self._session_id += 1
             sid = self._session_id
             old_proc = self._proc
+            old_buf = self._active_buf
             self._proc = None
+            self._active_buf = None
             self._stop_event.set()
 
-        self._kill_proc_safe(old_proc)
+            is_http = source.startswith("http://") or source.startswith("https://")
+            af_str = self._build_af_string()
 
-        is_http = source.startswith("http://") or source.startswith("https://")
-        af_str = self._build_af_string()
-
-        with self._lock:
-            if sid != self._session_id:
-                return
             self._current_source = source
             self._expected_duration = max(0.0, float(expected_duration or 0.0))
             self._base_offset = max(0.0, float(start_sec or 0.0))
@@ -581,6 +795,10 @@ class StreamAudioEngine:
             self._stop_event = threading.Event()
             stop_ev = self._stop_event
 
+        if old_buf is not None:
+            old_buf.close()
+        self._kill_proc_async(old_proc)
+
         threading.Thread(
             target=self._playback_worker,
             args=(sid, source, is_http, self._base_offset, af_str, stop_ev),
@@ -590,19 +808,28 @@ class StreamAudioEngine:
 
     def _spawn_ffmpeg(self, source: str, is_http: bool, start_sec: float, af_str: str) -> subprocess.Popen:
         cmd = [self.ffmpeg_exe]
-        cmd.extend([
-            "-analyzeduration", "250000",
-            "-probesize", "32768",
-            "-fflags", "+nobuffer",
-            "-flags", "low_delay",
-        ])
         if is_http:
             cmd.extend([
+                "-analyzeduration", "120000",
+                "-probesize", "32768",
+                "-fflags", "+nobuffer+discardcorrupt",
+                "-flags", "low_delay",
+                "-http_persistent", "1",
+                "-rw_timeout", "10000000",
                 "-reconnect", "1",
                 "-reconnect_streamed", "1",
+                "-reconnect_on_network_error", "1",
                 "-reconnect_at_eof", "0",
-                "-reconnect_delay_max", "3",
+                "-reconnect_delay_max", "2",
             ])
+        else:
+            cmd.extend([
+                "-analyzeduration", "80000",
+                "-probesize", "32768",
+                "-fflags", "+nobuffer",
+                "-flags", "low_delay",
+            ])
+
         if start_sec > 0.15:
             cmd.extend(["-ss", f"{start_sec:.2f}"])
 
@@ -625,30 +852,57 @@ class StreamAudioEngine:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
+            bufsize=65536,
             creationflags=creationflags,
         )
 
     def _update_spectrum(self, samples_f32: np.ndarray):
         try:
             mono = samples_f32[0::2]
-            if len(mono) < 256:
+            n = len(mono)
+            if n < 512:
                 return
-            windowed = mono[:512] * np.hanning(min(512, len(mono)))
+            windowed = mono[:512] * self._hann_512
             spec = np.abs(np.fft.rfft(windowed))
-            if len(spec) < 32:
+            spec_len = len(spec)
+            if spec_len < 32:
                 return
-            # 5 логарифмических полос (суббас, бас, середина, верхняя середина, верха)
-            slices = [(1, 4), (4, 10), (10, 26), (26, 65), (65, min(180, len(spec)))]
             new_bars = []
-            for i, (a, b) in enumerate(slices):
-                val = float(np.mean(spec[a:b])) / 140000.0
+            for i, (a, b) in enumerate(self._spectrum_slices):
+                hi = min(b, spec_len)
+                val = float(np.mean(spec[a:hi])) / 140000.0
                 val = min(1.0, max(0.0, val ** 0.65))
                 prev = self.spectrum_bars[i]
-                smoothed = prev * 0.55 + val * 0.45
-                new_bars.append(smoothed)
+                new_bars.append(prev * 0.55 + val * 0.45)
             self.spectrum_bars = new_bars
         except Exception:
             pass
+
+    def _start_reader_thread(
+        self,
+        proc: subprocess.Popen,
+        buf: PCMStreamBuffer,
+        chunk_bytes: int,
+        stop_ev: threading.Event,
+    ) -> threading.Thread:
+        """Отдельный reader-поток непрерывно вычитывает PCM из ffmpeg в буфер, сглаживая сетевые провалы."""
+        def reader():
+            stdout = proc.stdout
+            try:
+                while not stop_ev.is_set() and stdout is not None:
+                    raw = stdout.read(chunk_bytes)
+                    if not raw:
+                        break
+                    if not buf.put_chunk(raw, timeout=0.2):
+                        break
+            except Exception:
+                pass
+            finally:
+                buf.mark_eof()
+
+        t = threading.Thread(target=reader, daemon=True, name="pcm-reader")
+        t.start()
+        return t
 
     def _playback_worker(
         self,
@@ -666,136 +920,167 @@ class StreamAudioEngine:
         had_fatal_error = False
         fade_in_samples_left = int(self.sample_rate * 0.025) * 2  # ~25мс мягкий старт без щелчка
 
-        chunk_bytes = 8192  # ~46мс стерео int16 — плавно, без треска при скролле UI
+        chunk_bytes = 8192  # ~46мс стерео int16
+        chunk_counter = 0
 
         try:
-            with sd.RawOutputStream(
-                samplerate=self.sample_rate,
-                channels=2,
-                dtype="int16",
-                blocksize=2048,
-            ) as stream:
+            stream = self._acquire_output_stream()
+
+            while not stop_ev.is_set() and sid == self._session_id:
+                try:
+                    proc = self._spawn_ffmpeg(source, is_http, cur_start, af_str)
+                except Exception:
+                    had_fatal_error = True
+                    break
+
+                pcm_buf = PCMStreamBuffer(max_chunks=56)  # ~2.5 сек буфер опережения
+                with self._lock:
+                    if sid != self._session_id or stop_ev.is_set():
+                        pcm_buf.close()
+                        self._kill_proc_async(proc)
+                        return
+                    self._proc = proc
+                    self._active_buf = pcm_buf
+
+                self._start_reader_thread(proc, pcm_buf, chunk_bytes, stop_ev)
+
+                pause_started_at: float | None = None
+                detached_on_pause = False
+                got_any_audio = False
+                tail_bytes = b""
+
                 while not stop_ev.is_set() and sid == self._session_id:
-                    try:
-                        proc = self._spawn_ffmpeg(source, is_http, cur_start, af_str)
-                    except Exception:
-                        had_fatal_error = True
-                        break
+                    if self.is_paused:
+                        self.spectrum_bars = [b * 0.7 for b in self.spectrum_bars]
+                        if pause_started_at is None:
+                            pause_started_at = time.time()
+                            self._paused_at_pos = self.get_position()
 
-                    with self._lock:
-                        if sid != self._session_id or stop_ev.is_set():
-                            self._kill_proc_safe(proc)
-                            return
-                        self._proc = proc
-
-                    pause_started_at: float | None = None
-                    detached_on_pause = False
-                    got_any_audio = False
-
-                    while not stop_ev.is_set() and sid == self._session_id:
-                        if self.is_paused:
-                            self.spectrum_bars = [b * 0.7 for b in self.spectrum_bars]
-                            if pause_started_at is None:
-                                pause_started_at = time.time()
-                                self._paused_at_pos = self.get_position()
-
-                            # Если онлайн-поток на паузе > 8 сек — закрываем ffmpeg,
-                            # чтобы YouTube не разорвал сокет с ложным EOF
-                            if is_http and not detached_on_pause and (time.time() - pause_started_at) >= self.HTTP_PAUSE_IDLE_LIMIT:
-                                detached_on_pause = True
-                                self._paused_detached = True
-                                self._kill_proc_safe(proc)
-                                with self._lock:
-                                    if self._proc is proc:
-                                        self._proc = None
-                                break
-
-                            time.sleep(0.03)
-                            continue
-
-                        pause_started_at = None
-                        raw = proc.stdout.read(chunk_bytes) if proc.stdout else b""
-                        if not raw:
+                        # Если онлайн-поток на паузе > 8 сек — закрываем ffmpeg,
+                        # чтобы YouTube не разорвал сокет с ложным EOF
+                        if is_http and not detached_on_pause and (time.time() - pause_started_at) >= self.HTTP_PAUSE_IDLE_LIMIT:
+                            detached_on_pause = True
+                            self._paused_detached = True
+                            pcm_buf.close()
+                            self._kill_proc_async(proc)
+                            with self._lock:
+                                if self._proc is proc:
+                                    self._proc = None
+                                if self._active_buf is pcm_buf:
+                                    self._active_buf = None
                             break
 
-                        got_any_audio = True
-                        # Выравниваем по 4 байта (1 стерео сэмпл int16)
-                        rem = len(raw) % 4
-                        if rem:
-                            raw = raw[:-rem]
-                        if not raw:
-                            continue
+                        time.sleep(0.035)
+                        continue
 
+                    pause_started_at = None
+                    has_item, raw = pcm_buf.get_chunk(timeout=0.15)
+                    if not has_item:
+                        continue
+                    if raw is None:
+                        break
+
+                    got_any_audio = True
+                    if tail_bytes:
+                        raw = tail_bytes + raw
+                        tail_bytes = b""
+
+                    rem = len(raw) % 4
+                    if rem:
+                        tail_bytes = raw[-rem:]
+                        raw = raw[:-rem]
+                    if not raw:
+                        continue
+
+                    chunk_counter += 1
+                    gain = 0.0 if self.muted else (self.volume ** 2.2)
+                    need_spectrum = self.spectrum_enabled and not self.muted and (chunk_counter & 1 == 0)
+
+                    if not self.muted and gain >= 0.995 and fade_in_samples_left == 0:
+                        if need_spectrum:
+                            self._update_spectrum(np.frombuffer(raw, dtype=np.int16).astype(np.float32))
+                        out_bytes = raw
+                    elif self.muted or gain <= 0.0001:
+                        out_bytes = bytes(len(raw))
+                    else:
                         samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-
-                        # Логарифмическая регулировка громкости
-                        gain = 0.0 if self.muted else (self.volume ** 2.2)
-                        if gain != 1.0:
-                            samples *= gain
-
-                        # Короткий fade-in без щелчка
+                        samples *= gain
                         if fade_in_samples_left > 0:
                             n = min(len(samples), fade_in_samples_left)
-                            ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
-                            samples[:n] *= ramp
+                            samples[:n] *= np.linspace(0.0, 1.0, n, dtype=np.float32)
                             fade_in_samples_left -= n
-
-                        self._update_spectrum(samples)
+                        if need_spectrum:
+                            self._update_spectrum(samples)
                         np.clip(samples, -32768.0, 32767.0, out=samples)
                         out_bytes = samples.astype(np.int16).tobytes()
 
-                        stream.write(out_bytes)
-                        self._frames_played += len(out_bytes) // 4
-
-                    # Вышли из внутреннего цикла чтения
-                    if stop_ev.is_set() or sid != self._session_id:
-                        self._kill_proc_safe(proc)
-                        return
-
-                    # Если вышли из-за долгой паузы на HTTP — спокойно ждем снятия паузы и переподключаемся
-                    if detached_on_pause:
-                        while self.is_paused and not stop_ev.is_set() and sid == self._session_id:
-                            self.spectrum_bars = [b * 0.7 for b in self.spectrum_bars]
-                            time.sleep(0.04)
+                    with self._write_lock:
                         if stop_ev.is_set() or sid != self._session_id:
-                            return
-                        cur_start = self._paused_at_pos
-                        self._base_offset = cur_start
-                        self._frames_played = 0
-                        self._paused_detached = False
-                        fade_in_samples_left = int(self.sample_rate * 0.025) * 2
-                        continue
-
-                    rc = proc.poll()
-                    if rc is None:
+                            break
                         try:
-                            rc = proc.wait(timeout=0.5)
-                        except subprocess.TimeoutExpired:
-                            rc = -1
-                    self._kill_proc_safe(proc)
+                            stream.write(out_bytes)
+                        except Exception:
+                            # Устройство вывода могло смениться (наушники/Bluetooth) — мягко переоткрываем
+                            self._close_output_stream()
+                            stream = self._acquire_output_stream()
+                            stream.write(out_bytes)
+                    self._frames_played += len(out_bytes) // 4
 
-                    pos = self.get_position()
-                    premature_eof = (
-                        is_http
-                        and self._expected_duration > 15.0
-                        and pos < (self._expected_duration - 4.0)
-                        and (rc != 0 or not got_any_audio)
-                    )
+                pcm_buf.close()
 
-                    if premature_eof and reconnect_attempts < max_reconnects:
-                        reconnect_attempts += 1
-                        cur_start = pos
-                        self._base_offset = cur_start
-                        self._frames_played = 0
-                        fade_in_samples_left = int(self.sample_rate * 0.025) * 2
-                        time.sleep(0.4)
-                        continue
+                # Вышли из внутреннего цикла чтения
+                if stop_ev.is_set() or sid != self._session_id:
+                    self._kill_proc_async(proc)
+                    return
 
-                    if got_any_audio or rc == 0:
-                        finished_naturally = True
-                    else:
-                        had_fatal_error = True
-                    break
+                # Если вышли из-за долгой паузы на HTTP — освобождаем устройство, ждем снятия паузы и переподключаемся
+                if detached_on_pause:
+                    with self._write_lock:
+                        if sid == self._session_id:
+                            self._close_output_stream()
+                    while self.is_paused and not stop_ev.is_set() and sid == self._session_id:
+                        self.spectrum_bars = [b * 0.7 for b in self.spectrum_bars]
+                        time.sleep(0.05)
+                    if stop_ev.is_set() or sid != self._session_id:
+                        return
+                    stream = self._acquire_output_stream()
+                    cur_start = self._paused_at_pos
+                    self._base_offset = cur_start
+                    self._frames_played = 0
+                    self._paused_detached = False
+                    fade_in_samples_left = int(self.sample_rate * 0.025) * 2
+                    continue
+
+                rc = proc.poll()
+                if rc is None:
+                    try:
+                        rc = proc.wait(timeout=0.35)
+                    except subprocess.TimeoutExpired:
+                        rc = -1
+                self._kill_proc_async(proc)
+
+                pos = self.get_position()
+                premature_eof = (
+                    is_http
+                    and self._expected_duration > 15.0
+                    and pos < (self._expected_duration - 4.0)
+                    and (rc != 0 or not got_any_audio)
+                )
+
+                if premature_eof and reconnect_attempts < max_reconnects:
+                    reconnect_attempts += 1
+                    cur_start = pos
+                    self._base_offset = cur_start
+                    self._frames_played = 0
+                    fade_in_samples_left = int(self.sample_rate * 0.025) * 2
+                    time.sleep(0.3)
+                    continue
+
+                if got_any_audio or rc == 0:
+                    finished_naturally = True
+                else:
+                    had_fatal_error = True
+                break
 
         except Exception:
             had_fatal_error = True
@@ -812,17 +1097,23 @@ class StreamAudioEngine:
         elif had_fatal_error and self.on_stream_error:
             self.on_stream_error()
 
-    def stop(self):
+    def stop(self, release_device: bool = False):
         with self._lock:
             self._session_id += 1
             self._stop_event.set()
             old_proc = self._proc
+            old_buf = self._active_buf
             self._proc = None
+            self._active_buf = None
             self.is_playing = False
             self.is_paused = False
             self._paused_detached = False
             self.spectrum_bars = [0.0, 0.0, 0.0, 0.0, 0.0]
-        self._kill_proc_safe(old_proc)
+        if old_buf is not None:
+            old_buf.close()
+        self._kill_proc_async(old_proc)
+        if release_device:
+            self._close_output_stream()
 
     def toggle_pause(self):
         if not self.is_playing:
@@ -833,13 +1124,14 @@ class StreamAudioEngine:
         else:
             self.is_paused = False
 
-    def seek(self, seconds: float):
-        if self._current_source and self.is_playing:
+    def seek(self, seconds: float, override_source: str | None = None):
+        source = override_source or self._current_source
+        if source and self.is_playing:
             was_paused = self.is_paused
             target = max(0.0, float(seconds))
             if self._expected_duration > 0:
                 target = min(target, max(0.0, self._expected_duration - 0.5))
-            self.play_source(self._current_source, start_sec=target, expected_duration=self._expected_duration)
+            self.play_source(source, start_sec=target, expected_duration=self._expected_duration)
             if was_paused:
                 self._paused_at_pos = target
                 self.is_paused = True
@@ -917,17 +1209,47 @@ class AetherStreamingApp(ctk.CTk):
             on_stream_error_callback=lambda: self.after(0, self._on_stream_error),
         )
 
-        self.cover_cache = CoverCacheManager(max_mem_items=160)
-        self.prefetch_pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="prefetch")
+        self.cover_cache = CoverCacheManager(max_mem_items=220, max_pil_items=120)
+        self.stream_cache = StreamURLCache(STREAM_CACHE_FILE, max_items=500)
+        self.state_writer = DebouncedStateWriter(delay_sec=0.45)
+        self._meta_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="meta")
         self.thread_local = threading.local()
         self._state_lock = threading.Lock()
         self._closing = False
+
+        # Приоритетный резолвер потоков + локальный LRU-кэш аудио (следующий трек стартует мгновенно)
+        self.resolver = PriorityTrackResolver(
+            resolve_fn=self._resolve_track_network,
+            num_workers=3,
+            on_resolved_cb=self._on_track_resolved_bg,
+        )
+        self.audio_cache = AudioFileCache(
+            AUDIO_CACHE_DIR,
+            max_bytes=160 * 1024 * 1024,
+            urgent_active_fn=lambda: self.resolver.has_urgent_work,
+        )
+
+        # Общая палитра шрифтов (исключает утечку сотен Tk-шрифтов при скролле и перерисовке строк)
+        self._fonts = {
+            "row_num": ctk.CTkFont(size=12, weight="normal"),
+            "row_num_active": ctk.CTkFont(size=12, weight="bold"),
+            "row_info": ctk.CTkFont(family="Segoe UI", size=12, weight="normal"),
+            "row_info_active": ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            "row_dur": ctk.CTkFont(size=11),
+            "row_icon": ctk.CTkFont(size=14),
+            "row_icon_bold": ctk.CTkFont(size=14, weight="bold"),
+            "sidebar_title": ctk.CTkFont(size=11, weight="bold"),
+            "sidebar_body": ctk.CTkFont(size=11),
+            "sidebar_btn": ctk.CTkFont(size=10, weight="normal"),
+            "sidebar_btn_bold": ctk.CTkFont(size=10, weight="bold"),
+        }
 
         # Кэш поисковых запросов
         self.search_cache: OrderedDict[str, list[TrackItem]] = OrderedDict()
 
         # Профиль вкуса, история, очередь и аккаунт Google
         self.liked_tracks: list[TrackItem] = []
+        self._liked_uids: set[str] = set()
         self.liked_timestamps: dict[str, float] = {}
         self.unliked_timestamps: dict[str, float] = {}
         self.history_tracks: list[TrackItem] = []
@@ -968,17 +1290,28 @@ class AetherStreamingApp(ctk.CTk):
         self.current_page: str = "wave"       # "wave" | "search" | "library" | "queue"
         self.library_subtab: str = "liked"    # "liked" | "history" | "local"
         self.library_filter_text: str = ""
+        self._lib_filter_timer: str | None = None
         self.wave_mood: str = "Любое"
         self.wave_fetching: bool = False
         self._is_searching: bool = False
+        self._search_gen: int = 0
         self._last_search_text: str = ""
 
-        # Реестр виджетов строк для точечного обновления БЕЗ сброса скролла
+        # Реестр виджетов строк и прогрессивного рендера БЕЗ фриза UI
         self._row_registry: dict[str, list[dict]] = {}
+        self._render_gen: int = 0
         self._wave_scroll: ctk.CTkScrollableFrame | None = None
         self._wave_status_lbl: ctk.CTkLabel | None = None
         self._wave_main_btn: ctk.CTkButton | None = None
         self._wave_rendered_count: int = 0
+
+        # Dirty-check кэш для _tick_loop (убирает лишние перерисовки Tk Canvas)
+        self._last_elapsed_str: str = "00:00"
+        self._last_slider_pos: float = -1.0
+        self._last_meter_color: str = ""
+        self._last_meter_heights: list[int] = [-1, -1, -1, -1, -1]
+        self._kb_seek_timer: str | None = None
+        self._kb_seek_target: float | None = None
 
         # Плеер
         self.play_gen: int = 0
@@ -1052,12 +1385,12 @@ class AetherStreamingApp(ctk.CTk):
                     if pressed and not prev_state[vk]:
                         self.after(0, handler)
                     prev_state[vk] = pressed
-                time.sleep(0.06)
+                time.sleep(0.08)
         except Exception:
             pass
 
     # ==========================================
-    # ИНСТАНСЫ YT-DLP
+    # ИНСТАНСЫ YT-DLP (ПЕРЕИСПОЛЬЗУЮТСЯ ПО ПОТОКАМ БЕЗ ПЕРЕСОЗДАНИЯ)
     # ==========================================
     def _get_extract_ydl(self, fallback: bool = False) -> yt_dlp.YoutubeDL:
         attr = "fallback_ydl" if fallback else "extract_ydl"
@@ -1069,9 +1402,17 @@ class AetherStreamingApp(ctk.CTk):
         return ydl
 
     def _get_search_ydl(self, playlist_end: int = 15) -> yt_dlp.YoutubeDL:
-        opts = dict(YDL_FAST_SEARCH_OPTS)
-        opts["playlistend"] = playlist_end
-        return yt_dlp.YoutubeDL(opts)
+        cache = getattr(self.thread_local, "search_ydls", None)
+        if cache is None:
+            cache = {}
+            self.thread_local.search_ydls = cache
+        ydl = cache.get(playlist_end)
+        if ydl is None:
+            opts = dict(YDL_FAST_SEARCH_OPTS)
+            opts["playlistend"] = playlist_end
+            ydl = yt_dlp.YoutubeDL(opts)
+            cache[playlist_end] = ydl
+        return ydl
 
     # ==========================================
     # АТОМАРНОЕ СОХРАНЕНИЕ И ЗАГРУЗКА СОСТОЯНИЯ
@@ -1099,6 +1440,7 @@ class AetherStreamingApp(ctk.CTk):
     def _apply_state_dict(self, data: dict, update_ui: bool = False):
         self.state_updated_at = float(data.get("updated_at") or time.time())
         self.liked_tracks = [TrackItem.from_dict(x) for x in data.get("liked_tracks", []) if isinstance(x, dict)]
+        self._liked_uids = {t.uid for t in self.liked_tracks}
         self.liked_timestamps = {
             str(k): float(v) for k, v in (data.get("liked_timestamps") or {}).items()
         }
@@ -1176,31 +1518,18 @@ class AetherStreamingApp(ctk.CTk):
         except Exception:
             pass
 
-    def _write_state_file_atomic(self, filepath: str, data: dict):
-        parent = os.path.dirname(os.path.abspath(filepath))
-        os.makedirs(parent, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(prefix="state_", suffix=".tmp", dir=parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, filepath)
-        finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-
-    def _save_user_state(self, sync_cloud: bool = True):
+    def _save_user_state(self, sync_cloud: bool = True, immediate: bool = False):
         self.state_updated_at = time.time()
         data = self._export_state_dict()
-        with self._state_lock:
-            try:
-                self._write_state_file_atomic(STATE_FILE, data)
-                if self.google_sync.is_signed_in:
-                    self._write_state_file_atomic(self._active_state_file(), data)
-            except Exception:
-                pass
+        targets: list[tuple[str, dict]] = [(STATE_FILE, data)]
+        if self.google_sync.is_signed_in:
+            targets.append((self._active_state_file(), data))
+
+        if immediate or self._closing:
+            self.state_writer.schedule(targets)
+            self.state_writer.flush_sync()
+        else:
+            self.state_writer.schedule(targets)
 
         if sync_cloud and self.google_sync.is_signed_in and not self._closing:
             self._cloud_dirty = True
@@ -2192,15 +2521,6 @@ class AetherStreamingApp(ctk.CTk):
     def _refresh_sidebar_taste_box(self):
         if not hasattr(self, "taste_summary_box"):
             return
-        for w in self.taste_summary_box.winfo_children():
-            w.destroy()
-
-        ctk.CTkLabel(
-            self.taste_summary_box,
-            text="Профиль вкуса",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=THEME["text_muted"],
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 3))
 
         seeds = self.custom_seeds + [a for a in self._get_top_taste_artists(4) if a not in self.custom_seeds]
         if seeds:
@@ -2210,29 +2530,53 @@ class AetherStreamingApp(ctk.CTk):
         else:
             summary_txt = "Добавьте любимых артистов или ставьте ♥"
 
+        norm_on = self.engine.normalize_audio
+        norm_txt = "Нормализация: ВКЛ" if norm_on else "Нормализация: ВЫКЛ"
+
+        # Обновляем виджеты на месте без разрушения и пересоздания фрейма
+        if hasattr(self, "_taste_summary_lbl") and self._taste_summary_lbl.winfo_exists():
+            self._taste_summary_lbl.configure(text=summary_txt)
+            self._taste_norm_btn.configure(
+                text=norm_txt,
+                fg_color=self.accent_soft if norm_on else THEME["bg_root"],
+                text_color=self.accent_color if norm_on else THEME["text_dim"],
+                font=self._fonts["sidebar_btn_bold"] if norm_on else self._fonts["sidebar_btn"],
+            )
+            return
+
+        for w in self.taste_summary_box.winfo_children():
+            w.destroy()
+
         ctk.CTkLabel(
             self.taste_summary_box,
+            text="Профиль вкуса",
+            font=self._fonts["sidebar_title"],
+            text_color=THEME["text_muted"],
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 3))
+
+        self._taste_summary_lbl = ctk.CTkLabel(
+            self.taste_summary_box,
             text=summary_txt,
-            font=ctk.CTkFont(size=11),
+            font=self._fonts["sidebar_body"],
             text_color=THEME["text_dim"],
             wraplength=192,
             justify="left",
             anchor="w",
-        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 8))
+        )
+        self._taste_summary_lbl.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 8))
 
-        # Компактный переключатель нормализации громкости
-        norm_txt = "Нормализация: ВКЛ" if self.engine.normalize_audio else "Нормализация: ВЫКЛ"
-        ctk.CTkButton(
+        self._taste_norm_btn = ctk.CTkButton(
             self.taste_summary_box,
             text=norm_txt,
             height=24,
             corner_radius=8,
-            fg_color=self.accent_soft if self.engine.normalize_audio else THEME["bg_root"],
+            fg_color=self.accent_soft if norm_on else THEME["bg_root"],
             hover_color=THEME["bg_hover"],
-            text_color=self.accent_color if self.engine.normalize_audio else THEME["text_dim"],
-            font=ctk.CTkFont(size=10, weight="bold" if self.engine.normalize_audio else "normal"),
+            text_color=self.accent_color if norm_on else THEME["text_dim"],
+            font=self._fonts["sidebar_btn_bold"] if norm_on else self._fonts["sidebar_btn"],
             command=self._toggle_normalize,
-        ).grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        )
+        self._taste_norm_btn.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
 
     # ==========================================
     # НАВИГАЦИЯ И РЕАКТИВНЫЕ ОБНОВЛЕНИЯ СТРОК
@@ -2253,6 +2597,7 @@ class AetherStreamingApp(ctk.CTk):
                 btn.configure(fg_color="transparent", text_color=THEME["text_muted"])
 
     def _render_page(self):
+        self._render_gen += 1
         self._row_registry.clear()
         self._wave_scroll = None
         self._wave_status_lbl = None
@@ -2284,11 +2629,11 @@ class AetherStreamingApp(ctk.CTk):
                     ref["num"].configure(
                         text="▶" if is_active else str(ref["idx"] + 1),
                         text_color=self.accent_color if is_active else THEME["text_dim"],
-                        font=ctk.CTkFont(size=12, weight="bold" if is_active else "normal"),
+                        font=self._fonts["row_num_active"] if is_active else self._fonts["row_num"],
                     )
                     ref["info"].configure(
                         text_color=self.accent_color if is_active else THEME["text_main"],
-                        font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold" if is_active else "normal"),
+                        font=self._fonts["row_info_active"] if is_active else self._fonts["row_info"],
                     )
                 except tk.TclError:
                     pass
@@ -2547,9 +2892,47 @@ class AetherStreamingApp(ctk.CTk):
             )
             return
 
-        for idx, track in enumerate(self.wave_queue):
-            self._build_track_row(scroll, idx, track, self.wave_queue, is_wave=True)
+        self._render_rows_chunked(scroll, self.wave_queue, self.wave_queue, is_wave=True, start_idx=0)
         self._wave_rendered_count = len(self.wave_queue)
+
+    def _render_rows_chunked(
+        self,
+        parent: ctk.CTkScrollableFrame,
+        items: list[TrackItem],
+        queue_ref: list[TrackItem],
+        is_wave: bool = False,
+        start_idx: int = 0,
+        first_batch: int = 16,
+        next_batch: int = 10,
+    ):
+        """
+        Прогрессивный рендер списка треков: первые 16 строк рисуются мгновенно (заполняя экран),
+        остальные дорисовываются маленькими порциями через event loop без фриза интерфейса.
+        """
+        gen = self._render_gen
+        total = len(items)
+        end_first = min(total, start_idx + first_batch)
+        for idx in range(start_idx, end_first):
+            self._build_track_row(parent, idx, items[idx], queue_ref, is_wave=is_wave)
+
+        if end_first >= total:
+            return
+
+        def render_next(cursor: int):
+            if self._closing or gen != self._render_gen:
+                return
+            try:
+                if not parent.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            stop = min(total, cursor + next_batch)
+            for i in range(cursor, stop):
+                self._build_track_row(parent, i, items[i], queue_ref, is_wave=is_wave)
+            if stop < total:
+                self.after(10, lambda c=stop: render_next(c))
+
+        self.after(10, lambda c=end_first: render_next(c))
 
     def _append_new_wave_rows(self):
         """Дорисовывает только новые треки в конец потока, не трогая существующие строки и скролл."""
@@ -2566,9 +2949,9 @@ class AetherStreamingApp(ctk.CTk):
             for w in self._wave_scroll.winfo_children():
                 w.destroy()
 
-        for idx in range(self._wave_rendered_count, len(self.wave_queue)):
-            self._build_track_row(self._wave_scroll, idx, self.wave_queue[idx], self.wave_queue, is_wave=True)
+        start_idx = self._wave_rendered_count
         self._wave_rendered_count = len(self.wave_queue)
+        self._render_rows_chunked(self._wave_scroll, self.wave_queue, self.wave_queue, is_wave=True, start_idx=start_idx)
         self._update_wave_status_label()
 
     def _add_custom_seed(self):
@@ -2693,8 +3076,7 @@ class AetherStreamingApp(ctk.CTk):
             ).grid(row=0, column=0, pady=40)
             return
 
-        for idx, track in enumerate(self.search_results):
-            self._build_track_row(scroll, idx, track, self.search_results, is_wave=False)
+        self._render_rows_chunked(scroll, self.search_results, self.search_results, is_wave=False, start_idx=0)
 
     # ==========================================
     # СТРАНИЦА 3: КОЛЛЕКЦИЯ (ЛЮБИМЫЕ / ИСТОРИЯ / ФАЙЛЫ)
@@ -2791,12 +3173,26 @@ class AetherStreamingApp(ctk.CTk):
         self._populate_library_scroll()
 
     def _on_library_filter_change(self, _e=None):
-        self.library_filter_text = self.lib_filter_var.get().strip().lower()
-        self._populate_library_scroll()
+        new_text = self.lib_filter_var.get().strip().lower()
+        if new_text == self.library_filter_text:
+            return
+        self.library_filter_text = new_text
+        if self._lib_filter_timer is not None:
+            try:
+                self.after_cancel(self._lib_filter_timer)
+            except Exception:
+                pass
+        self._lib_filter_timer = self.after(160, self._flush_library_filter)
+
+    def _flush_library_filter(self):
+        self._lib_filter_timer = None
+        if not self._closing and self.current_page == "library":
+            self._populate_library_scroll()
 
     def _populate_library_scroll(self):
         if not hasattr(self, "_lib_scroll") or not self._lib_scroll.winfo_exists():
             return
+        self._render_gen += 1
         self._row_registry.clear()
         for w in self._lib_scroll.winfo_children():
             w.destroy()
@@ -2825,8 +3221,7 @@ class AetherStreamingApp(ctk.CTk):
             )
             return
 
-        for idx, track in enumerate(items):
-            self._build_track_row(self._lib_scroll, idx, track, items, is_wave=False)
+        self._render_rows_chunked(self._lib_scroll, items, items, is_wave=False, start_idx=0)
 
     def _switch_library_subtab(self, sub: str):
         self.library_subtab = sub
@@ -2931,8 +3326,13 @@ class AetherStreamingApp(ctk.CTk):
 
     def _add_to_up_next(self, track: TrackItem):
         self.up_next_queue.append(track)
-        if track.is_online and not track.has_fresh_stream:
-            self._prefetch_batch([track])
+        if track.is_online:
+            prio = (
+                PriorityTrackResolver.PRIORITY_NEXT
+                if len(self.up_next_queue) == 1
+                else PriorityTrackResolver.PRIORITY_PREFETCH
+            )
+            self._prefetch_batch([track], priority=prio)
         self._sync_nav_buttons()
         if self.current_page == "queue":
             self._render_page()
@@ -2967,7 +3367,7 @@ class AetherStreamingApp(ctk.CTk):
             row,
             text="▶" if is_current else str(num_idx + 1),
             width=28,
-            font=ctk.CTkFont(size=12, weight="bold" if is_current else "normal"),
+            font=self._fonts["row_num_active"] if is_current else self._fonts["row_num"],
             text_color=self.accent_color if is_current else THEME["text_dim"],
         )
         num_lbl.grid(row=0, column=0, padx=(10, 6))
@@ -2997,7 +3397,7 @@ class AetherStreamingApp(ctk.CTk):
             fg_color="transparent",
             hover_color=THEME["bg_hover"],
             text_color=title_color,
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold" if is_current else "normal"),
+            font=self._fonts["row_info_active"] if is_current else self._fonts["row_info"],
             command=on_click_play,
         )
         info_btn.grid(row=0, column=2, sticky="nsew", pady=4)
@@ -3007,7 +3407,7 @@ class AetherStreamingApp(ctk.CTk):
             row,
             text=dur_str,
             width=46,
-            font=ctk.CTkFont(size=11),
+            font=self._fonts["row_dur"],
             text_color=THEME["text_muted"],
         ).grid(row=0, column=3, padx=6)
 
@@ -3022,7 +3422,7 @@ class AetherStreamingApp(ctk.CTk):
                 fg_color="transparent",
                 hover_color=THEME["bg_hover"],
                 text_color=THEME["text_dim"],
-                font=ctk.CTkFont(size=14),
+                font=self._fonts["row_icon"],
                 command=lambda qi=queue_list_idx: self._remove_from_up_next(qi),
             ).grid(row=0, column=4, padx=2)
         else:
@@ -3035,7 +3435,7 @@ class AetherStreamingApp(ctk.CTk):
                 fg_color="transparent",
                 hover_color=THEME["bg_hover"],
                 text_color=THEME["text_dim"],
-                font=ctk.CTkFont(size=14, weight="bold"),
+                font=self._fonts["row_icon_bold"],
                 command=lambda t=track: self._add_to_up_next(t),
             ).grid(row=0, column=4, padx=2)
 
@@ -3049,7 +3449,7 @@ class AetherStreamingApp(ctk.CTk):
             fg_color="transparent",
             hover_color=THEME["bg_hover"],
             text_color=THEME["like_red"] if liked else THEME["text_muted"],
-            font=ctk.CTkFont(size=14),
+            font=self._fonts["row_icon"],
             command=lambda t=track: self._toggle_like_track(t),
         )
         like_btn.grid(row=0, column=5, padx=(2, 10))
@@ -3157,24 +3557,24 @@ class AetherStreamingApp(ctk.CTk):
             existing_sigs = {t.signature for t in self.wave_queue if t.signature} | self.session_played_sigs
 
             try:
-                with self._get_search_ydl(playlist_end=18) as ydl:
-                    info = ydl.extract_info(target_query, download=False)
-                    for entry in (info.get("entries") or []) if info else []:
-                        if not entry or not self._is_valid_music_candidate(entry):
-                            continue
-                        item = self._entry_to_track(entry, reason=reason_label)
-                        if not item:
-                            continue
-                        if item.uid in existing_uids:
-                            continue
-                        if item.signature and item.signature in existing_sigs:
-                            continue
-                        if self.artist_scores.get(item.artist, 0.0) <= -4.0:
-                            continue
-                        existing_uids.add(item.uid)
-                        if item.signature:
-                            existing_sigs.add(item.signature)
-                        candidates.append(item)
+                ydl = self._get_search_ydl(playlist_end=18)
+                info = ydl.extract_info(target_query, download=False)
+                for entry in (info.get("entries") or []) if info else []:
+                    if not entry or not self._is_valid_music_candidate(entry):
+                        continue
+                    item = self._entry_to_track(entry, reason=reason_label)
+                    if not item:
+                        continue
+                    if item.uid in existing_uids:
+                        continue
+                    if item.signature and item.signature in existing_sigs:
+                        continue
+                    if self.artist_scores.get(item.artist, 0.0) <= -4.0:
+                        continue
+                    existing_uids.add(item.uid)
+                    if item.signature:
+                        existing_sigs.add(item.signature)
+                    candidates.append(item)
             except Exception:
                 pass
 
@@ -3192,19 +3592,24 @@ class AetherStreamingApp(ctk.CTk):
             def done():
                 self.wave_fetching = False
                 if ordered:
+                    was_empty = len(self.wave_queue) == 0
                     self.wave_queue.extend(ordered)
                     self._append_new_wave_rows()
-                    self._prefetch_batch(ordered[:4])
+                    if autoplay and self.wave_queue:
+                        self._play_from_list(self.wave_queue, 0, is_wave=True)
+                    elif was_empty:
+                        # Прогреваем первый трек с высоким приоритетом, чтобы нажатие «Слушать волну» сработало мгновенно
+                        self._prefetch_batch(ordered[:1], priority=PriorityTrackResolver.PRIORITY_NEXT)
+                        self._prefetch_batch(ordered[1:3], priority=PriorityTrackResolver.PRIORITY_PREFETCH)
+                    else:
+                        self._prefetch_batch(ordered[:2], priority=PriorityTrackResolver.PRIORITY_PREFETCH)
                 else:
                     self._update_wave_status_label()
-
-                if autoplay and self.wave_queue:
-                    self._play_from_list(self.wave_queue, 0, is_wave=True)
 
             if not self._closing:
                 self.after(0, done)
 
-        threading.Thread(target=worker, daemon=True, name="wave-fetch").start()
+        self._meta_pool.submit(worker)
 
     # ==========================================
     # ПОИСК (ПОДДЕРЖКА ПРЯМЫХ ССЫЛОК YOUTUBE И ПЛЕЙЛИСТОВ) + СКАЧИВАНИЕ MP3
@@ -3220,6 +3625,8 @@ class AetherStreamingApp(ctk.CTk):
         if not query:
             return
         self._last_search_text = query
+        self._search_gen += 1
+        search_gen = self._search_gen
         cache_key = query.lower()
 
         if cache_key in self.search_cache:
@@ -3228,7 +3635,8 @@ class AetherStreamingApp(ctk.CTk):
             self._is_searching = False
             if self.current_page == "search":
                 self._render_page()
-            self._prefetch_batch(self.search_results[:5])
+            self.resolver.bump_prefetch_generation()
+            self._prefetch_batch(self.search_results[:2], priority=PriorityTrackResolver.PRIORITY_PREFETCH)
             return
 
         self._is_searching = True
@@ -3240,25 +3648,27 @@ class AetherStreamingApp(ctk.CTk):
         def worker():
             results: list[TrackItem] = []
             try:
-                with self._get_search_ydl(playlist_end=25 if is_direct_url else 12) as ydl:
-                    info = ydl.extract_info(target, download=False)
-                    if info:
-                        entries = info.get("entries")
-                        if entries is not None:
-                            for entry in entries:
-                                if not entry:
-                                    continue
-                                item = self._entry_to_track(entry)
-                                if item:
-                                    results.append(item)
-                        else:
-                            item = self._entry_to_track(info)
+                ydl = self._get_search_ydl(playlist_end=25 if is_direct_url else 12)
+                info = ydl.extract_info(target, download=False)
+                if info:
+                    entries = info.get("entries")
+                    if entries is not None:
+                        for entry in entries:
+                            if not entry:
+                                continue
+                            item = self._entry_to_track(entry)
                             if item:
                                 results.append(item)
+                    else:
+                        item = self._entry_to_track(info)
+                        if item:
+                            results.append(item)
             except Exception:
                 pass
 
             def done():
+                if search_gen != self._search_gen or self._closing:
+                    return
                 self._is_searching = False
                 self.search_results = results
                 if results:
@@ -3267,12 +3677,13 @@ class AetherStreamingApp(ctk.CTk):
                         self.search_cache.popitem(last=False)
                 if self.current_page == "search":
                     self._render_page()
-                self._prefetch_batch(results[:5])
+                self.resolver.bump_prefetch_generation()
+                self._prefetch_batch(results[:2], priority=PriorityTrackResolver.PRIORITY_PREFETCH)
 
             if not self._closing:
                 self.after(0, done)
 
-        threading.Thread(target=worker, daemon=True, name="search").start()
+        self._meta_pool.submit(worker)
 
     def _entry_to_track(self, entry: dict, reason: str | None = None) -> TrackItem | None:
         vid = entry.get("id")
@@ -3287,11 +3698,8 @@ class AetherStreamingApp(ctk.CTk):
         if not vid:
             vid = extract_video_id(url)
 
-        thumbs = entry.get("thumbnails") or []
-        thumb_url = thumbs[-1]["url"] if thumbs else (
-            f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg" if vid else None
-        )
-        return TrackItem(
+        thumb_url = pick_optimal_thumbnail(entry.get("thumbnails"), video_id=vid)
+        item = TrackItem(
             title=entry.get("title") or "Без названия",
             artist=entry.get("uploader") or entry.get("channel") or "YouTube",
             duration=float(entry.get("duration") or 0),
@@ -3300,6 +3708,13 @@ class AetherStreamingApp(ctk.CTk):
             source_type="YT",
             reason=reason,
         )
+        # Подхватываем уже кэшированный stream_url для того же видео мгновенно
+        cached = self.stream_cache.get(item.uid)
+        if cached and cached.get("url"):
+            item.set_stream(cached["url"], expires_at=cached.get("expires_at"))
+            if item.duration <= 0 and cached.get("duration"):
+                item.duration = float(cached["duration"])
+        return item
 
     def _on_download_current(self):
         track = self.current_track
@@ -3346,72 +3761,107 @@ class AetherStreamingApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True, name="download-mp3").start()
 
     # ==========================================
-    # ПОТОКОБЕЗОПАСНЫЙ РЕЗОЛВ И ПРЕДЗАГРУЗКА
+    # ПРИОРИТЕТНЫЙ РЕЗОЛВ, ГЛОБАЛЬНЫЙ КЭШ ПОТОКОВ И ПРЕДЗАГРУЗКА АУДИО
     # ==========================================
-    def _resolve_track_sync(self, track: TrackItem, force_refresh: bool = False) -> str | None:
-        if not force_refresh and track.has_fresh_stream:
+    def _hydrate_track_from_cache(self, track: TrackItem) -> str | None:
+        if track.has_fresh_stream and track.stream_url:
             return track.stream_url
+        cached = self.stream_cache.get(track.uid)
+        if cached and cached.get("url"):
+            track.set_stream(cached["url"], expires_at=cached.get("expires_at"))
+            if track.duration <= 0 and cached.get("duration"):
+                track.duration = float(cached["duration"])
+            if not track.thumbnail_url and cached.get("thumbnail_url"):
+                track.thumbnail_url = cached["thumbnail_url"]
+            return track.stream_url
+        return None
+
+    def _resolve_track_network(self, track: TrackItem, force_refresh: bool = False) -> str | None:
+        if not force_refresh:
+            cached_url = self._hydrate_track_from_cache(track)
+            if cached_url:
+                return cached_url
         if not track.webpage_url:
             return None
 
-        # Координируем параллельные запросы к одному треку через threading.Event
-        with track._resolve_lock:
-            if not force_refresh and track.has_fresh_stream:
-                return track.stream_url
-            if track._resolve_event is not None:
-                wait_ev = track._resolve_event
-                owner = False
-            else:
-                wait_ev = threading.Event()
-                track._resolve_event = wait_ev
-                owner = True
+        url = None
+        info = None
+        for use_fallback in (False, True):
+            try:
+                ydl = self._get_extract_ydl(fallback=use_fallback)
+                info = ydl.extract_info(track.webpage_url, download=False)
+                url = extract_stream_url_from_info(info)
+                if url:
+                    break
+            except Exception:
+                continue
 
-        if not owner:
-            wait_ev.wait(timeout=18.0)
-            return track.stream_url
+        if info:
+            if info.get("duration") and track.duration <= 0:
+                track.duration = float(info["duration"])
+            if not track.thumbnail_url:
+                thumb = pick_optimal_thumbnail(info.get("thumbnails"), video_id=track.video_id) or info.get("thumbnail")
+                if thumb:
+                    track.thumbnail_url = thumb
 
-        try:
-            url = None
-            info = None
-            for use_fallback in (False, True):
-                try:
-                    ydl = self._get_extract_ydl(fallback=use_fallback)
-                    info = ydl.extract_info(track.webpage_url, download=False)
-                    url = extract_stream_url_from_info(info)
-                    if url:
-                        break
-                except Exception:
-                    continue
-
-            if url:
-                track.stream_url = url
-                track.stream_resolved_at = time.time()
-            if info:
-                if info.get("duration") and track.duration <= 0:
-                    track.duration = float(info["duration"])
-                if not track.thumbnail_url and info.get("thumbnail"):
-                    track.thumbnail_url = info["thumbnail"]
-        finally:
-            with track._resolve_lock:
-                wait_ev.set()
-                track._resolve_event = None
+        if url:
+            exp = self.stream_cache.put(
+                track.uid,
+                url,
+                duration=track.duration,
+                thumbnail_url=track.thumbnail_url,
+            )
+            track.set_stream(url, expires_at=exp)
 
         return track.stream_url
 
-    def _prefetch_batch(self, tracks: list[TrackItem]):
+    def _on_track_resolved_bg(self, track: TrackItem, url: str, priority: int):
+        """После резолва срочного или следующего трека тихо кэшируем его аудио на диск."""
+        if self._closing or not track.is_online:
+            return
+        if priority <= PriorityTrackResolver.PRIORITY_NEXT:
+            self.audio_cache.warm_async(track.uid, url)
+
+    def _prefetch_batch(self, tracks: list[TrackItem], priority: int = PriorityTrackResolver.PRIORITY_PREFETCH):
         if self._closing:
             return
         for t in tracks:
-            if t and t.is_online and not t.has_fresh_stream:
-                self.prefetch_pool.submit(self._resolve_track_sync, t)
+            if not t or not t.is_online:
+                continue
+            if self.audio_cache.get_cached_path(t.uid) is not None:
+                continue
+            cached_url = self._hydrate_track_from_cache(t)
+            if cached_url:
+                if priority <= PriorityTrackResolver.PRIORITY_NEXT:
+                    self.audio_cache.warm_async(t.uid, cached_url)
+                continue
+            self.resolver.submit(t, priority=priority)
 
     def _prefetch_upcoming_in_queue(self, current_idx: int):
-        upcoming = list(self.up_next_queue[:2])
+        high_prio: list[TrackItem] = []
+        low_prio: list[TrackItem] = []
+
+        if self.up_next_queue:
+            high_prio.append(self.up_next_queue[0])
+            if len(self.up_next_queue) > 1:
+                low_prio.append(self.up_next_queue[1])
+
         if self.active_queue:
-            for offset in (1, 2, 3):
-                if 0 <= current_idx + offset < len(self.active_queue):
-                    upcoming.append(self.active_queue[current_idx + offset])
-        self._prefetch_batch(upcoming)
+            nxt_idx = current_idx + 1
+            if 0 <= nxt_idx < len(self.active_queue):
+                if not high_prio:
+                    high_prio.append(self.active_queue[nxt_idx])
+                else:
+                    low_prio.append(self.active_queue[nxt_idx])
+            for offset in (2, 3):
+                idx2 = current_idx + offset
+                if 0 <= idx2 < len(self.active_queue):
+                    low_prio.append(self.active_queue[idx2])
+
+        if high_prio:
+            self._prefetch_batch(high_prio, priority=PriorityTrackResolver.PRIORITY_NEXT)
+        if low_prio:
+            self._prefetch_batch(low_prio, priority=PriorityTrackResolver.PRIORITY_PREFETCH)
 
     # ==========================================
     # ВОСПРОИЗВЕДЕНИЕ, ВКУС И ЗАЩИТА ОТ ЗАЦИКЛИВАНИЯ ОШИБОК
@@ -3462,15 +3912,18 @@ class AetherStreamingApp(ctk.CTk):
         self._track_started_at = time.time()
         self._track_credited = False
 
-        if self.is_wave_session and (len(self.wave_queue) - index) <= 4:
+        if self.is_wave_session and (len(self.wave_queue) - index) <= 6:
             self._fetch_wave_batch(autoplay=False)
         self._prefetch_upcoming_in_queue(index)
 
         self._start_track_playback(track, gen, old_uid)
 
     def _start_track_playback(self, track: TrackItem, gen: int, old_uid: str | None):
-        need_resolve = track.is_online and not track.has_fresh_stream
-        self._update_bottom_bar(track, loading=need_resolve)
+        cached_audio_path = self.audio_cache.get_cached_path(track.uid) if track.is_online else None
+        cached_url = None if cached_audio_path else (self._hydrate_track_from_cache(track) if track.is_online else None)
+        need_resolve = track.is_online and not cached_audio_path and not cached_url
+
+        self._update_bottom_bar(track, loading=need_resolve, is_cached=bool(cached_audio_path))
         self._update_row_highlight_in_place(old_uid, track.uid)
         self._record_history(track)
 
@@ -3483,25 +3936,36 @@ class AetherStreamingApp(ctk.CTk):
             self._sync_play_button()
             return
 
-        if track.has_fresh_stream and track.stream_url:
+        # 1. Мгновенный старт из локального аудио-кэша (< 30 мс, моментальная перемотка)
+        if cached_audio_path:
             self._consecutive_errors = 0
-            self.engine.play_source(track.stream_url, start_sec=0.0, expected_duration=track.duration)
+            self.engine.play_source(cached_audio_path, start_sec=0.0, expected_duration=track.duration)
             self._sync_play_button()
             return
 
+        # 2. Мгновенный старт по уже кэшированной прямой ссылке + тихое кэширование на диск
+        if cached_url:
+            self._consecutive_errors = 0
+            self.engine.play_source(cached_url, start_sec=0.0, expected_duration=track.duration)
+            self._sync_play_button()
+            self.audio_cache.warm_async(track.uid, cached_url)
+            return
+
+        # 3. Срочный приоритетный резолв (priority=0 — обгоняет весь фоновый префетч)
         self.engine.stop()
         self._sync_play_button()
 
-        def resolve_worker():
-            stream_url = self._resolve_track_sync(track)
-
+        def on_resolved(stream_url: str | None):
             def on_ready():
                 if gen != self.play_gen or self._closing:
                     return
                 if stream_url:
                     self._consecutive_errors = 0
-                    self._update_bottom_bar(track, loading=False)
-                    self.engine.play_source(stream_url, start_sec=0.0, expected_duration=track.duration)
+                    # Если за время ожидания трек уже успел попасть в дисковый кэш — берем с диска
+                    local_cached = self.audio_cache.get_cached_path(track.uid)
+                    src = local_cached or stream_url
+                    self._update_bottom_bar(track, loading=False, is_cached=bool(local_cached))
+                    self.engine.play_source(src, start_sec=0.0, expected_duration=track.duration)
                     self._sync_play_button()
                     self._load_bar_cover_async(track)
                 else:
@@ -3510,20 +3974,19 @@ class AetherStreamingApp(ctk.CTk):
             if not self._closing:
                 self.after(0, on_ready)
 
-        threading.Thread(target=resolve_worker, daemon=True, name="resolve-play").start()
+        self.resolver.submit(track, priority=PriorityTrackResolver.PRIORITY_URGENT, on_done=on_resolved)
 
     def _on_stream_error(self):
-        # Если ссылка протухла прямо перед стартом — пробуем 1 раз перерезолвить
+        # Если ссылка протухла прямо перед стартом — пробуем 1 раз перерезолвить с высоким приоритетом
         track = self.current_track
         if track and track.is_online and self._consecutive_errors == 0:
             self._consecutive_errors += 1
             track.invalidate_stream()
+            self.stream_cache.invalidate(track.uid)
             gen = self.play_gen
             self.bar_source_badge.configure(text="ПОВТОР…")
 
-            def retry_worker():
-                url = self._resolve_track_sync(track, force_refresh=True)
-
+            def on_retried(url: str | None):
                 def apply():
                     if gen != self.play_gen or self._closing:
                         return
@@ -3537,7 +4000,12 @@ class AetherStreamingApp(ctk.CTk):
                 if not self._closing:
                     self.after(0, apply)
 
-            threading.Thread(target=retry_worker, daemon=True, name="retry-stream").start()
+            self.resolver.submit(
+                track,
+                priority=PriorityTrackResolver.PRIORITY_URGENT,
+                force_refresh=True,
+                on_done=on_retried,
+            )
             return
 
         self._handle_playback_failure("ОШИБКА")
@@ -3552,40 +4020,42 @@ class AetherStreamingApp(ctk.CTk):
             self.after(600, self._on_next)
 
     # ==========================================
-    # ОБЛОЖКИ, АКЦЕНТЫ И НИЖНЯЯ ПАНЕЛЬ
+    # ОБЛОЖКИ, АКЦЕНТЫ И НИЖНЯЯ ПАНЕЛЬ (ВСЯ ОБРАБОТКА PIL В ФОНОВОМ ПУЛЕ)
     # ==========================================
     def _load_bar_cover_async(self, track: TrackItem):
-        if track.cover_pil is not None:
-            rounded = make_rounded_cover(track.cover_pil, size=(56, 56), radius=10)
-            ctk_img = ctk.CTkImage(light_image=rounded, dark_image=rounded, size=(56, 56))
-            self.cover_cache.put_mem(f"bar:{track.uid}", ctk_img)
-            self.bar_cover_label.configure(image=ctk_img)
-            self.bar_cover_label._img_ref = ctk_img
-            accent, soft = extract_muted_accent(track.cover_pil)
-            self._apply_accent(accent, soft)
-            return
-
-        if not track.thumbnail_url:
+        cache_key = f"bar:{track.uid}"
+        cached_img = self.cover_cache.get_mem(cache_key)
+        cached_accent = self.cover_cache.get_accent(track.uid)
+        if cached_img is not None:
+            self.bar_cover_label.configure(image=cached_img)
+            self.bar_cover_label._img_ref = cached_img
+            if cached_accent is not None:
+                self._apply_accent(cached_accent[0], cached_accent[1])
             return
 
         def on_pil(pil_img: Image.Image):
-            track.cover_pil = pil_img
             rounded = make_rounded_cover(pil_img, size=(56, 56), radius=10)
-            accent, soft = extract_muted_accent(pil_img)
+            acc = self.cover_cache.get_accent(track.uid)
+            if acc is None:
+                acc = extract_muted_accent(pil_img)
+                self.cover_cache.put_accent(track.uid, acc[0], acc[1])
 
             def apply():
                 if self._closing or not self.current_track or self.current_track.uid != track.uid:
                     return
                 ctk_img = ctk.CTkImage(light_image=rounded, dark_image=rounded, size=(56, 56))
-                self.cover_cache.put_mem(f"bar:{track.uid}", ctk_img)
+                self.cover_cache.put_mem(cache_key, ctk_img)
                 self.bar_cover_label.configure(image=ctk_img)
                 self.bar_cover_label._img_ref = ctk_img
-                self._apply_accent(accent, soft)
+                self._apply_accent(acc[0], acc[1])
 
             if not self._closing:
                 self.after(0, apply)
 
-        self.cover_cache.fetch_pil_async(track.thumbnail_url, on_pil)
+        if track.thumbnail_url:
+            self.cover_cache.fetch_pil_async(track.thumbnail_url, on_pil)
+        elif not track.is_online and track.filepath:
+            self.cover_cache.fetch_local_cover_async(track.filepath, on_pil)
 
     def _load_thumbnail_async(self, track: TrackItem, label: ctk.CTkLabel, size=(40, 40), radius=8):
         cache_key = f"{size[0]}:{track.uid}"
@@ -3595,19 +4065,7 @@ class AetherStreamingApp(ctk.CTk):
             label._img_ref = cached
             return
 
-        if track.cover_pil is not None:
-            rounded = make_rounded_cover(track.cover_pil, size=size, radius=radius)
-            ctk_img = ctk.CTkImage(light_image=rounded, dark_image=rounded, size=size)
-            self.cover_cache.put_mem(cache_key, ctk_img)
-            label.configure(image=ctk_img)
-            label._img_ref = ctk_img
-            return
-
-        if not track.thumbnail_url:
-            return
-
         def on_pil(pil_img: Image.Image):
-            track.cover_pil = pil_img
             rounded = make_rounded_cover(pil_img, size=size, radius=radius)
 
             def apply():
@@ -3625,9 +4083,12 @@ class AetherStreamingApp(ctk.CTk):
             if not self._closing:
                 self.after(0, apply)
 
-        self.cover_cache.fetch_pil_async(track.thumbnail_url, on_pil)
+        if track.thumbnail_url:
+            self.cover_cache.fetch_pil_async(track.thumbnail_url, on_pil)
+        elif not track.is_online and track.filepath:
+            self.cover_cache.fetch_local_cover_async(track.filepath, on_pil)
 
-    def _update_bottom_bar(self, track: TrackItem, loading: bool = False):
+    def _update_bottom_bar(self, track: TrackItem, loading: bool = False, is_cached: bool = False):
         short_title = track.title if len(track.title) <= 28 else track.title[:26] + "…"
         short_artist = track.artist if len(track.artist) <= 30 else track.artist[:28] + "…"
         self.bar_title.configure(text=short_title)
@@ -3635,6 +4096,8 @@ class AetherStreamingApp(ctk.CTk):
         self.total_label.configure(text=format_time(track.duration) if track.duration > 0 else "--:--")
         self.progress_slider.configure(to=max(1.0, track.duration if track.duration > 0 else 100.0))
         self.progress_slider.set(0)
+        self._last_slider_pos = 0.0
+        self._last_elapsed_str = "00:00"
         self.elapsed_label.configure(text="00:00")
 
         liked = self._is_liked(track)
@@ -3644,8 +4107,9 @@ class AetherStreamingApp(ctk.CTk):
         )
 
         if track.is_online:
+            badge_txt = "СТАРТ…" if loading else ("FAST" if is_cached else "STREAM")
             self.bar_source_badge.configure(
-                text="СТАРТ…" if loading else "STREAM",
+                text=badge_txt,
                 text_color=self.accent_color,
                 fg_color=self.accent_soft,
             )
@@ -3655,17 +4119,19 @@ class AetherStreamingApp(ctk.CTk):
             self.bar_source_badge.configure(text="LOCAL", text_color=self.accent_color, fg_color=self.accent_soft)
             self.bar_download_btn.grid_remove()
 
-        if track.cover_pil is not None:
+        cached_bar = self.cover_cache.get_mem(f"bar:{track.uid}")
+        if cached_bar is not None:
             self._load_bar_cover_async(track)
         else:
             self.bar_cover_label.configure(image=self.bar_default_cover)
             self._apply_accent(THEME["wave_gold"], THEME["wave_soft"])
-            if track.is_online:
-                self._load_bar_cover_async(track)
+            self._load_bar_cover_async(track)
 
         self._update_tray_state()
 
     def _apply_accent(self, accent: str, soft: str):
+        if accent == self.accent_color and soft == self.accent_soft:
+            return
         self.accent_color = accent
         self.accent_soft = soft
         self.progress_slider.configure(progress_color=accent, button_hover_color=accent)
@@ -3685,7 +4151,7 @@ class AetherStreamingApp(ctk.CTk):
     # ЛАЙКИ, ДИЗЛАЙКИ, EQ И УПРАВЛЕНИЕ
     # ==========================================
     def _is_liked(self, track: TrackItem) -> bool:
-        return any(t.uid == track.uid for t in self.liked_tracks)
+        return track.uid in self._liked_uids
 
     def _toggle_like_current(self):
         if self.current_track:
@@ -3695,11 +4161,13 @@ class AetherStreamingApp(ctk.CTk):
         now = time.time()
         if self._is_liked(track):
             self.liked_tracks = [t for t in self.liked_tracks if t.uid != track.uid]
+            self._liked_uids.discard(track.uid)
             self.unliked_timestamps[track.uid] = now
             self._adjust_artist_score(track.artist, -2.5, save=True)
             liked = False
         else:
             self.liked_tracks.insert(0, track)
+            self._liked_uids.add(track.uid)
             self.liked_timestamps[track.uid] = now
             self.unliked_timestamps.pop(track.uid, None)
             self.disliked_uids.discard(track.uid)
@@ -3729,6 +4197,7 @@ class AetherStreamingApp(ctk.CTk):
         if self._is_liked(self.current_track):
             self.unliked_timestamps[uid] = time.time()
         self.liked_tracks = [t for t in self.liked_tracks if t.uid != uid]
+        self._liked_uids.discard(uid)
         self._adjust_artist_score(self.current_track.artist, -5.0, save=True)
         self._track_credited = True
         self._refresh_sidebar_taste_box()
@@ -3825,13 +4294,30 @@ class AetherStreamingApp(ctk.CTk):
     def _on_seek_start(self, _e):
         self.is_seeking = True
 
+    def _seek_current_track(self, target_sec: float):
+        """Перемотка с автоматическим переходом на локальный кэш-файл, если он уже скачался в фоне."""
+        override_src = None
+        if self.current_track and self.current_track.is_online:
+            cached_path = self.audio_cache.get_cached_path(self.current_track.uid)
+            if cached_path:
+                override_src = cached_path
+        self.engine.seek(target_sec, override_source=override_src)
+
     def _on_slider_drag(self, val):
         if self.is_seeking:
-            self.elapsed_label.configure(text=format_time(float(val)))
+            fval = float(val)
+            t_str = format_time(fval)
+            if t_str != self._last_elapsed_str:
+                self._last_elapsed_str = t_str
+                self.elapsed_label.configure(text=t_str)
+            self._last_slider_pos = fval
 
     def _on_seek_end(self, _e):
         if self.is_seeking:
-            self.engine.seek(float(self.progress_slider.get()))
+            target = float(self.progress_slider.get())
+            self._last_slider_pos = target
+            self._last_elapsed_str = format_time(target)
+            self._seek_current_track(target)
             self.is_seeking = False
 
     # ==========================================
@@ -3917,13 +4403,43 @@ class AetherStreamingApp(ctk.CTk):
         if not self._is_typing_in_input():
             self._on_play_pause()
 
+    def _schedule_keyboard_seek(self, delta: float):
+        """Коалесцирует быстрые нажатия стрелок ←/→, чтобы не перезапускать ffmpeg по 5 раз в секунду."""
+        if not self.engine.is_playing:
+            return
+        base = self._kb_seek_target if self._kb_seek_target is not None else self.engine.get_position()
+        target = max(0.0, base + delta)
+        if self.current_track and self.current_track.duration > 0:
+            target = min(target, max(0.0, self.current_track.duration - 0.5))
+        self._kb_seek_target = target
+        self.progress_slider.set(target)
+        t_str = format_time(target)
+        self._last_elapsed_str = t_str
+        self._last_slider_pos = target
+        self.elapsed_label.configure(text=t_str)
+
+        if self._kb_seek_timer is not None:
+            try:
+                self.after_cancel(self._kb_seek_timer)
+            except Exception:
+                pass
+
+        def commit():
+            self._kb_seek_timer = None
+            t = self._kb_seek_target
+            self._kb_seek_target = None
+            if t is not None and not self._closing:
+                self._seek_current_track(t)
+
+        self._kb_seek_timer = self.after(120, commit)
+
     def _hk_seek_back(self, _e):
         if not self._is_typing_in_input():
-            self.engine.seek(max(0.0, self.engine.get_position() - 5.0))
+            self._schedule_keyboard_seek(-5.0)
 
     def _hk_seek_fwd(self, _e):
         if not self._is_typing_in_input():
-            self.engine.seek(self.engine.get_position() + 5.0)
+            self._schedule_keyboard_seek(5.0)
 
     def _hk_vol_up(self, _e):
         if not self._is_typing_in_input():
@@ -3953,7 +4469,7 @@ class AetherStreamingApp(ctk.CTk):
             self.search_entry.focus_set()
 
     # ==========================================
-    # ОСНОВНОЙ ЦИКЛ UI (ПРОГРЕСС + ЖИВОЙ ИНДИКАТОР)
+    # ОСНОВНОЙ ЦИКЛ UI (DIRTY-CHECKED ПРОГРЕСС + ЖИВОЙ ИНДИКАТОР)
     # ==========================================
     def _tick_loop(self):
         if self._closing:
@@ -3965,7 +4481,10 @@ class AetherStreamingApp(ctk.CTk):
         except Exception:
             is_visible = True
 
-        if self.engine.is_playing and not self.is_seeking:
+        # Отключаем FFT в аудиопотоке, когда окно свернуто в трей
+        self.engine.spectrum_enabled = is_visible
+
+        if self.engine.is_playing and not self.is_seeking and self._kb_seek_target is None:
             pos = self.engine.get_position()
             if self.current_track:
                 if self.current_track.duration > 0:
@@ -3976,22 +4495,34 @@ class AetherStreamingApp(ctk.CTk):
                 elif is_visible and pos > self.progress_slider.cget("to"):
                     self.progress_slider.configure(to=pos + 30.0)
             if is_visible:
-                self.progress_slider.set(pos)
-                self.elapsed_label.configure(text=format_time(pos))
+                # Перерисовываем слайдер только при заметном сдвиге, а текст — только раз в секунду
+                if abs(pos - self._last_slider_pos) >= 0.25:
+                    self._last_slider_pos = pos
+                    self.progress_slider.set(pos)
+                t_str = format_time(pos)
+                if t_str != self._last_elapsed_str:
+                    self._last_elapsed_str = t_str
+                    self.elapsed_label.configure(text=t_str)
 
-        # Обновляем 5-полосный минималистичный индикатор только когда окно видимо
+        # Обновляем 5-полосный индикатор только для изменившихся полос и только когда окно видимо
         if is_visible:
             bars = self.engine.spectrum_bars
             playing_active = self.engine.is_playing and not self.engine.is_paused and not self.engine.muted
             bar_color = self.accent_color if playing_active else THEME["text_dim"]
+            color_changed = bar_color != self._last_meter_color
+            if color_changed:
+                self._last_meter_color = bar_color
             for i, rect in enumerate(self.meter_rects):
                 lvl = bars[i] if playing_active else 0.0
                 h = max(2, int(2 + lvl * 15))
-                x0 = i * 5 + 1
-                self.meter_canvas.coords(rect, x0, 18 - h, x0 + 3, 18)
-                self.meter_canvas.itemconfig(rect, fill=bar_color)
+                if h != self._last_meter_heights[i]:
+                    self._last_meter_heights[i] = h
+                    x0 = i * 5 + 1
+                    self.meter_canvas.coords(rect, x0, 18 - h, x0 + 3, 18)
+                if color_changed:
+                    self.meter_canvas.itemconfig(rect, fill=bar_color)
 
-        self.after(90 if is_visible else 350, self._tick_loop)
+        self.after(95 if is_visible else 400, self._tick_loop)
 
     def _quit_app(self):
         if self._closing:
@@ -4005,14 +4536,17 @@ class AetherStreamingApp(ctk.CTk):
                 pass
             self._active_oauth_flow = None
 
-        if self._cloud_sync_timer is not None:
-            try:
-                self.after_cancel(self._cloud_sync_timer)
-            except Exception:
-                pass
-            self._cloud_sync_timer = None
+        for timer_attr in ("_cloud_sync_timer", "_lib_filter_timer", "_kb_seek_timer"):
+            t_id = getattr(self, timer_attr, None)
+            if t_id is not None:
+                try:
+                    self.after_cancel(t_id)
+                except Exception:
+                    pass
+                setattr(self, timer_attr, None)
 
-        self._save_user_state(sync_cloud=False)
+        self._save_user_state(sync_cloud=False, immediate=True)
+        self.state_writer.close()
 
         if self.google_sync.is_signed_in and self._cloud_dirty:
             snapshot = self._export_state_dict()
@@ -4032,11 +4566,14 @@ class AetherStreamingApp(ctk.CTk):
         except Exception:
             pass
 
-        self.engine.stop()
+        self.engine.stop(release_device=True)
+        self.resolver.close()
+        self.audio_cache.close()
+        self.stream_cache.close()
         self.cover_cache.shutdown()
         self.google_sync.close()
         try:
-            self.prefetch_pool.shutdown(wait=False, cancel_futures=True)
+            self._meta_pool.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
         self.destroy()

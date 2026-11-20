@@ -85,6 +85,7 @@ class TrayManager:
         self._thread: threading.Thread | None = None
         self._running = False
         self._notified_once = False
+        self._last_tray_sig: tuple[str, bool, bool] | None = None
 
     @property
     def is_running(self) -> bool:
@@ -156,10 +157,14 @@ class TrayManager:
         try:
             if title:
                 label = f"{artist} — {title}" if artist else title
-                tooltip = f"Aether Music • {label}"
-                self._icon.title = tooltip[:120]
+                tooltip = f"Aether Music • {label}"[:120]
             else:
-                self._icon.title = "Aether Music"
+                tooltip = "Aether Music"
+            sig = (tooltip, bool(self._get_play_state()), bool(self._get_liked_state()))
+            if sig == self._last_tray_sig:
+                return
+            self._last_tray_sig = sig
+            self._icon.title = tooltip
             self._icon.update_menu()
         except Exception:
             pass

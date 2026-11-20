@@ -725,18 +725,22 @@ class GoogleCloudSyncClient:
             sess = self.session
             self.session = None
 
-        if sess and (sess.refresh_token or sess.access_token):
-            token = sess.refresh_token or sess.access_token
-            try:
-                self.transport.request("POST", GOOGLE_REVOKE_URL, data={"token": token}, timeout=5.0)
-            except Exception:
-                pass
-
         try:
             if os.path.exists(self.auth_file):
                 os.remove(self.auth_file)
         except Exception:
             pass
+
+        if sess and (sess.refresh_token or sess.access_token):
+            token = sess.refresh_token or sess.access_token
+
+            def _revoke():
+                try:
+                    self.transport.request("POST", GOOGLE_REVOKE_URL, data={"token": token}, timeout=4.0)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_revoke, daemon=True, name="google-revoke").start()
 
     def close(self) -> None:
         self.transport.close()
