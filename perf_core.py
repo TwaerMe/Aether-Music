@@ -181,10 +181,10 @@ class StreamURLCache:
         try:
             with open(self.cache_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if not isinstance(data, dict):
+            if not isinstance(data, dict) or data.get("v") != 2:
                 return
             now = time.time()
-            items = data.get("entries") if isinstance(data.get("entries"), dict) else data
+            items = data.get("entries")
             if not isinstance(items, dict):
                 return
             for uid, entry in items.items():
@@ -192,12 +192,14 @@ class StreamURLCache:
                     continue
                 url = str(entry.get("url") or "")
                 exp = float(entry.get("expires_at") or 0.0)
+                hdrs = entry.get("headers")
                 if url and exp > now + 30.0:
                     self._entries[str(uid)] = {
                         "url": url,
                         "expires_at": exp,
                         "duration": float(entry.get("duration") or 0.0),
                         "thumbnail_url": entry.get("thumbnail_url"),
+                        "headers": dict(hdrs) if isinstance(hdrs, dict) else {},
                     }
             while len(self._entries) > self.max_items:
                 self._entries.popitem(last=False)
@@ -216,7 +218,9 @@ class StreamURLCache:
                 self._entries.pop(uid, None)
                 return None
             self._entries.move_to_end(uid)
-            return dict(entry)
+            res = dict(entry)
+            res["headers"] = dict(entry.get("headers") or {})
+            return res
 
     def put(
         self,
@@ -224,17 +228,20 @@ class StreamURLCache:
         url: str,
         duration: float = 0.0,
         thumbnail_url: str | None = None,
+        headers: dict[str, str] | None = None,
         now: float | None = None,
     ) -> float:
         if not uid or not url:
             return 0.0
         exp = parse_stream_expiry(url, now=now)
+        clean_hdrs = {str(k): str(v) for k, v in (headers or {}).items() if k and v}
         with self._lock:
             self._entries[uid] = {
                 "url": url,
                 "expires_at": exp,
                 "duration": float(duration or 0.0),
                 "thumbnail_url": thumbnail_url,
+                "headers": clean_hdrs,
             }
             self._entries.move_to_end(uid)
             while len(self._entries) > self.max_items:
@@ -278,7 +285,7 @@ class StreamURLCache:
             }
             self._dirty = False
         try:
-            atomic_write_json(self.cache_file, {"v": 1, "entries": live}, compact=True)
+            atomic_write_json(self.cache_file, {"v": 2, "entries": live}, compact=True)
         except Exception:
             pass
 
@@ -308,7 +315,7 @@ class AudioFileCache:
         self._lock = threading.Lock()
         self._inflight: set[str] = set()
         self._closing = False
-        self._task_q: queue.Queue[tuple[str, str] | None] = queue.Queue(maxsize=16)
+        self._task_q: queue.Queue[tuple[str, str, dict[str, str]] | None] = queue.Queue(maxsize=16)
 
         self._session = None
         if _requests is not None:
@@ -343,13 +350,23 @@ class AudioFileCache:
         digest = hashlib.sha1(uid.encode("utf-8", errors="ignore")).hexdigest()
         return os.path.join(self.cache_dir, f"{digest}.aud")
 
+    def invalidate(self, uid: str) -> None:
+        if not uid:
+            return
+        path = self._path_for_uid(uid)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
     def get_cached_path(self, uid: str) -> str | None:
         if not uid:
             return None
         path = self._path_for_uid(uid)
         try:
             st = os.stat(path)
-            if st.st_size >= 16384:
+            if st.st_size >= 32768:
                 try:
                     os.utime(path, None)
                 except Exception:
@@ -359,14 +376,15 @@ class AudioFileCache:
             return None
         return None
 
-    def warm_async(self, uid: str, stream_url: str) -> bool:
+    def warm_async(self, uid: str, stream_url: str, headers: dict[str, str] | None = None) -> bool:
         """Ставит аудиофайл в фоновую предзагрузку на диск (не блокирует UI)."""
         if self._closing or not uid or not stream_url or self._session is None:
             return False
         if not (stream_url.startswith("http://") or stream_url.startswith("https://")):
             return False
-        # Не пытаемся скачивать HLS-плейлисты m3u8 напрямую как единый файл
-        if ".m3u8" in stream_url.lower():
+        # Не пытаемся скачивать HLS/DASH плейлисты напрямую как единый файл
+        low = stream_url.lower()
+        if ".m3u8" in low or ".mpd" in low or "/manifest/" in low:
             return False
         if self.get_cached_path(uid) is not None:
             return False
@@ -377,7 +395,8 @@ class AudioFileCache:
             self._inflight.add(uid)
 
         try:
-            self._task_q.put_nowait((uid, stream_url))
+            req_hdrs = {str(k): str(v) for k, v in (headers or {}).items() if k and v}
+            self._task_q.put_nowait((uid, stream_url, req_hdrs))
             return True
         except queue.Full:
             with self._lock:
@@ -392,30 +411,35 @@ class AudioFileCache:
                 continue
             if item is None:
                 break
-            uid, stream_url = item
+            uid, stream_url, req_hdrs = item
             try:
-                self._download_one(uid, stream_url)
+                self._download_one(uid, stream_url, req_hdrs)
             except Exception:
                 pass
             finally:
                 with self._lock:
                     self._inflight.discard(uid)
 
-    def _download_one(self, uid: str, stream_url: str) -> bool:
+    def _download_one(self, uid: str, stream_url: str, req_hdrs: dict[str, str] | None = None) -> bool:
         if self._closing or self._session is None:
             return False
         target = self._path_for_uid(uid)
-        if os.path.isfile(target) and os.path.getsize(target) >= 16384:
+        if os.path.isfile(target) and os.path.getsize(target) >= 32768:
             return True
 
         part = f"{target}.{os.getpid()}.{threading.get_ident()}.part"
         written = 0
         try:
-            with self._session.get(stream_url, stream=True, timeout=(6.0, 10.0)) as resp:
+            with self._session.get(
+                stream_url,
+                headers=req_hdrs or None,
+                stream=True,
+                timeout=(6.0, 12.0),
+            ) as resp:
                 if resp.status_code not in (200, 206):
                     return False
                 ctype = str(resp.headers.get("Content-Type") or "").lower()
-                if "mpegurl" in ctype or "text/html" in ctype:
+                if "mpegurl" in ctype or "text/" in ctype or "json" in ctype or "xml" in ctype:
                     return False
                 clen = resp.headers.get("Content-Length")
                 if clen and clen.isdigit() and int(clen) > self.max_single_file_bytes:
@@ -428,15 +452,19 @@ class AudioFileCache:
                             return False
                         if not chunk:
                             continue
+                        if written == 0:
+                            # Отсекаем HTML/XML ответы на всякий случай
+                            head = chunk[:32].lstrip().lower()
+                            if head.startswith((b"<html", b"<!doctype", b"<?xml", b"#extm3u")):
+                                return False
                         written += len(chunk)
                         if written > self.max_single_file_bytes:
                             return False
                         f.write(chunk)
-                        # Уступаем канал и CPU, если прямо сейчас резолвится срочный клик пользователя
                         if self._urgent_active_fn is not None and self._urgent_active_fn():
-                            time.sleep(0.03)
+                            time.sleep(0.04)
 
-            if written >= 16384 and not self._closing:
+            if written >= 32768 and not self._closing:
                 os.replace(part, target)
                 self.enforce_size_limit()
                 return True

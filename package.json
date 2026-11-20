@@ -1,0 +1,13 @@
+{
+  "name": "aether-music-preview",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AI Studio preview & live Python diagnostics server for Aether Music desktop player",
+  "scripts": {
+    "dev": "node preview_server.mjs",
+    "start": "node preview_server.mjs",
+    "build": "python3 -m py_compile main.py perf_core.py google_sync.py tray_manager.py tests/test_aether_core.py",
+    "lint": "python3 -m unittest discover -s tests -v"
+  }
+}

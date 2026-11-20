@@ -304,7 +304,14 @@ class TestTrayAndMainAstIntegrity(unittest.TestCase):
         for forbidden_token in ("channel_url", "channel_handle", "channel_tracks", "channel_syncing"):
             self.assertNotIn(forbidden_token, src)
 
-        # New tray, Google sync & performance handlers must exist
+        # New tray, Google sync, playback & resize-optimization handlers must exist
+        class_names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+        self.assertIn("FastTrackScrollFrame", class_names)
+
         for required_fn in (
             "_on_window_close_request",
             "_restore_from_tray",
@@ -317,8 +324,24 @@ class TestTrayAndMainAstIntegrity(unittest.TestCase):
             "_schedule_keyboard_seek",
             "_seek_current_track",
             "_on_track_resolved_bg",
+            "_on_root_configure",
+            "_on_global_mousewheel",
+            "extract_stream_info",
+            "_sanitize_http_headers",
         ):
             self.assertIn(required_fn, func_names)
+
+        # Broken yt-dlp / ffmpeg / PortAudio / slow CTkScrollableFrame regressions must not return
+        for forbidden_regression in (
+            "android_vr",
+            "-probesize",
+            "-analyzeduration",
+            "-rw_timeout",
+            "-http_persistent",
+            'latency="low"',
+            "CTkScrollableFrame(",
+        ):
+            self.assertNotIn(forbidden_regression, src)
 
         self.assertIn("from perf_core import", src)
 
@@ -359,54 +382,85 @@ class TestPerfCoreOptimizations(unittest.TestCase):
             future_exp = int(now + 7200)
             cache = StreamURLCache(cache_file=cache_path, max_items=32)
 
-            cache.put("yt:1", f"https://example.com/a?expire={future_exp}", duration=180.0, thumbnail_url="https://img/1.jpg", now=now)
+            cache.put(
+                "yt:1",
+                f"https://example.com/a?expire={future_exp}",
+                duration=180.0,
+                thumbnail_url="https://img/1.jpg",
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.youtube.com/"},
+                now=now,
+            )
             hit = cache.get("yt:1", now=now)
             self.assertIsNotNone(hit)
             self.assertEqual(hit["duration"], 180.0)
             self.assertEqual(hit["thumbnail_url"], "https://img/1.jpg")
+            self.assertEqual(hit["headers"]["User-Agent"], "Mozilla/5.0")
 
             # Expired query returns None
             self.assertIsNone(cache.get("yt:1", now=now + 10000))
 
             # Re-add, flush, and reload from disk
-            cache.put("yt:2", f"https://example.com/b?expire={future_exp}", duration=210.0, now=now)
+            cache.put(
+                "yt:2",
+                f"https://example.com/b?expire={future_exp}",
+                duration=210.0,
+                headers={"User-Agent": "TestUA"},
+                now=now,
+            )
             cache.put("yt:3", f"https://example.com/c?expire={future_exp}", duration=120.0, now=now)
             cache.invalidate("yt:3")
             cache.close()
 
             reloaded = StreamURLCache(cache_file=cache_path, max_items=32)
-            self.assertIsNotNone(reloaded.get("yt:2", now=now))
+            hit2 = reloaded.get("yt:2", now=now)
+            self.assertIsNotNone(hit2)
+            self.assertEqual(hit2["headers"], {"User-Agent": "TestUA"})
             self.assertIsNone(reloaded.get("yt:3", now=now))
             reloaded.close()
+
+            # Legacy v1 cache files on disk must be ignored to drop stale URLs without headers
+            legacy_path = os.path.join(tmpdir, "legacy_v1.json")
+            with open(legacy_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"v": 1, "items": {"yt:old": {"url": f"https://example.com/old?expire={future_exp}", "expires_at": future_exp}}},
+                    f,
+                )
+            legacy_cache = StreamURLCache(cache_file=legacy_path, max_items=32)
+            self.assertIsNone(legacy_cache.get("yt:old", now=now))
+            legacy_cache.close()
 
     def test_audio_file_cache_hit_and_lru_eviction(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = AudioFileCache(cache_dir=tmpdir, max_bytes=10 * 1024 * 1024)
             try:
-                # Tiny file (< 16KB) must be ignored
+                # Tiny file (< 32KB) must be ignored
                 tiny_path = cache._path_for_uid("yt:tiny")
                 with open(tiny_path, "wb") as f:
                     f.write(b"x" * 1024)
                 self.assertIsNone(cache.get_cached_path("yt:tiny"))
 
-                # Valid cached file (>= 16KB) returns path
+                # Valid cached file (>= 32KB) returns path and invalidate() deletes it
                 ok_path = cache._path_for_uid("yt:ok")
                 with open(ok_path, "wb") as f:
                     f.write(b"a" * 32768)
                 self.assertEqual(cache.get_cached_path("yt:ok"), ok_path)
+                cache.invalidate("yt:ok")
+                self.assertIsNone(cache.get_cached_path("yt:ok"))
+                self.assertFalse(os.path.exists(ok_path))
 
-                # HLS playlist URLs must never be queued for single-file download
+                # HLS / DASH playlist URLs must never be queued for single-file download
                 self.assertFalse(cache.warm_async("yt:hls", "https://example.com/live/index.m3u8"))
+                self.assertFalse(cache.warm_async("yt:dash", "https://manifest.googlevideo.com/api/manifest/dash/id/1.mpd"))
 
                 # Enforce size limit evicts oldest .aud files first
-                cache.max_bytes = 60000
+                cache.max_bytes = 70000
                 p1 = cache._path_for_uid("yt:old1")
                 p2 = cache._path_for_uid("yt:old2")
                 p3 = cache._path_for_uid("yt:new3")
                 now = time.time()
                 for p, ts in ((p1, now - 300), (p2, now - 200), (p3, now + 50)):
                     with open(p, "wb") as f:
-                        f.write(b"z" * 30000)
+                        f.write(b"z" * 35000)
                     os.utime(p, (ts, ts))
                 cache.enforce_size_limit()
                 self.assertFalse(os.path.exists(p1))
