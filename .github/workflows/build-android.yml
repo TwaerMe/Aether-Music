@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-android:
     runs-on: ubuntu-latest
@@ -28,16 +31,38 @@ jobs:
         working-directory: android
         run: gradle assembleOriginOsRelease assembleStandardRelease --no-daemon
 
-      - name: Prepare APK outputs
+      - name: Prepare and verify APK outputs
         run: |
           mkdir -p android-dist
           cp android/app/build/outputs/apk/originOs/release/app-originOs-release.apk android-dist/AetherMusic-OriginOS-Widget.apk
           cp android/app/build/outputs/apk/standard/release/app-standard-release.apk android-dist/AetherMusic-Standard.apk
+          APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --verbose android-dist/AetherMusic-OriginOS-Widget.apk
+            "$APKSIGNER" verify --verbose android-dist/AetherMusic-Standard.apk
+          fi
 
-      - name: Upload Android APKs
+      - name: Upload Android APKs (Actions Artifact)
         uses: actions/upload-artifact@v4
         with:
           name: AetherMusic-Android-APKs
           path: |
             android-dist/AetherMusic-OriginOS-Widget.apk
             android-dist/AetherMusic-Standard.apk
+
+      - name: Publish direct APK download to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view android-latest >/dev/null 2>&1; then
+            gh release upload android-latest \
+              android-dist/AetherMusic-OriginOS-Widget.apk \
+              android-dist/AetherMusic-Standard.apk \
+              --clobber
+          else
+            gh release create android-latest \
+              android-dist/AetherMusic-OriginOS-Widget.apk \
+              android-dist/AetherMusic-Standard.apk \
+              --title "Aether Music Android (Latest)" \
+              --notes "Прямые APK-файлы без ZIP-архива. Для встроенного виджета OriginOS 6 скачайте AetherMusic-OriginOS-Widget.apk (удалив официальный Spotify). Если нужен официальный Spotify — скачайте AetherMusic-Standard.apk."
+          fi
