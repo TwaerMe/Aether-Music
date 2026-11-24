@@ -312,7 +312,7 @@ class AetherPlaybackService : MediaLibraryService() {
             return if (track != null) {
                 Futures.immediateFuture(LibraryResult.ofItem(track.toMediaItem(), null))
             } else {
-                Futures.immediateFuture(LibraryResult.ofError(LibraryResult.RESULT_ERROR_BAD_VALUE))
+                Futures.immediateFuture(LibraryResult.ofError<MediaItem>(LibraryResult.RESULT_ERROR_BAD_VALUE))
             }
         }
 

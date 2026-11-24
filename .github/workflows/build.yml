@@ -1,12 +1,110 @@
-name: Build Windows EXE
+name: Build Aether Music (Android APK + Windows EXE)
 
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  build-android:
+    name: Build Android APK (OriginOS 6 + Standard)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Accept Android SDK licenses & generate signing keystore
+        run: |
+          SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ -n "$SDK_DIR" ] && [ -x "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          fi
+          keytool -genkeypair -v \
+            -keystore /tmp/aether-release.jks \
+            -storetype PKCS12 \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -alias aether \
+            -storepass aether123456 \
+            -keypass aether123456 \
+            -dname "CN=Aether Music, OU=Mobile, O=Aether, L=City, ST=State, C=US"
+
+      - name: Build OriginOS 6 Widget APK & Standard APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: /tmp/aether-release.jks
+          ANDROID_KEYSTORE_PASSWORD: aether123456
+          ANDROID_KEY_ALIAS: aether
+          ANDROID_KEY_PASSWORD: aether123456
+        run: gradle assembleOriginOsRelease assembleStandardRelease --no-daemon --stacktrace
+
+      - name: Verify APK signatures and package names
+        run: |
+          mkdir -p android-dist
+          cp android/app/build/outputs/apk/originOs/release/app-originOs-release.apk android-dist/AetherMusic-OriginOS-Widget.apk
+          cp android/app/build/outputs/apk/standard/release/app-standard-release.apk android-dist/AetherMusic-Standard.apk
+          ls -lh android-dist/
+          SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          APKSIGNER=$(find "$SDK_DIR/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --verbose android-dist/AetherMusic-OriginOS-Widget.apk
+            "$APKSIGNER" verify --verbose android-dist/AetherMusic-Standard.apk
+          fi
+          AAPT2=$(find "$SDK_DIR/build-tools" -name aapt2 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$AAPT2" ]; then
+            "$AAPT2" dump badging android-dist/AetherMusic-OriginOS-Widget.apk | head -n 5
+            "$AAPT2" dump badging android-dist/AetherMusic-Standard.apk | head -n 5
+          fi
+
+      - name: Upload Android OriginOS 6 Widget APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ANDROID-OriginOS6-Widget-APK
+          path: android-dist/AetherMusic-OriginOS-Widget.apk
+
+      - name: Upload Android Standard APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ANDROID-Standard-APK
+          path: android-dist/AetherMusic-Standard.apk
+
+      - name: Publish direct APK downloads to GitHub Releases
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view android-latest >/dev/null 2>&1; then
+            gh release upload android-latest \
+              android-dist/AetherMusic-OriginOS-Widget.apk \
+              android-dist/AetherMusic-Standard.apk \
+              --clobber
+          else
+            gh release create android-latest \
+              android-dist/AetherMusic-OriginOS-Widget.apk \
+              android-dist/AetherMusic-Standard.apk \
+              --target "${{ github.sha }}" \
+              --title "Aether Music Android (Latest APK)" \
+              --notes "Прямые APK-файлы для Android (без ZIP и без .exe). Для встроенного виджета OriginOS 6 скачайте AetherMusic-OriginOS-Widget.apk (удалив официальный Spotify). Если нужен официальный Spotify — скачайте AetherMusic-Standard.apk."
+          fi
+
+  build-windows:
+    name: Build Windows EXE (PC)
     runs-on: windows-latest
 
     steps:
@@ -26,8 +124,8 @@ jobs:
       - name: Build executable with PyInstaller
         run: pyinstaller --noconfirm --onefile --windowed --collect-all customtkinter --collect-all imageio_ffmpeg --collect-all sounddevice --collect-all _sounddevice_data --collect-all yt_dlp --collect-all certifi --collect-all pystray --name "AetherPlayer" main.py
 
-      - name: Upload EXE artifact
+      - name: Upload Windows EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AetherPlayer-Windows
+          name: WINDOWS-PC-EXE
           path: dist/AetherPlayer.exe

@@ -4,16 +4,19 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+    ?.takeIf { it.isNotBlank() && file(it).exists() }
+
 android {
     namespace = "com.aether.music"
-    compileSdk = 35
+    compileSdk = 34
 
     defaultConfig {
         applicationId = "com.aether.music"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "2.2.0"
+        versionCode = 2
+        versionName = "2.2.1"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -28,17 +31,28 @@ android {
             // so the built-in desktop music widget binds natively to our MediaLibraryService.
             applicationId = "com.spotify.music"
             resValue("string", "app_name", "Aether Music")
-            buildConfigField("Boolean", "IS_ORIGIN_OS_WIDGET_BUILD", "true")
+            buildConfigField("boolean", "IS_ORIGIN_OS_WIDGET_BUILD", "true")
         }
         create("standard") {
             dimension = "widgetMode"
             applicationId = "com.aether.music"
             resValue("string", "app_name", "Aether Music")
-            buildConfigField("Boolean", "IS_ORIGIN_OS_WIDGET_BUILD", "false")
+            buildConfigField("boolean", "IS_ORIGIN_OS_WIDGET_BUILD", "false")
         }
     }
 
     signingConfigs {
+        if (releaseKeystorePath != null) {
+            create("ciRelease") {
+                storeFile = file(releaseKeystorePath)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD") ?: "aether123456"
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: "aether"
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: "aether123456"
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
         getByName("debug") {
             enableV1Signing = true
             enableV2Signing = true
@@ -52,7 +66,11 @@ android {
         }
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (releaseKeystorePath != null) {
+                signingConfigs.getByName("ciRelease")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 
