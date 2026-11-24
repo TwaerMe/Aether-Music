@@ -30,6 +30,9 @@ import com.aether.music.data.Track
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.io.IOException
 
 @OptIn(UnstableApi::class)
@@ -83,10 +86,19 @@ class AetherPlaybackService : MediaLibraryService() {
             .build()
 
         exo.addListener(object : Player.Listener {
+            private var consecutiveErrors = 0
+
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 val track = Track.fromMediaItem(mediaItem) ?: return
                 library.recordPlay(track)
                 persistCurrentQueue(exo)
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    consecutiveErrors = 0
+                    _playbackError.value = null
+                }
             }
 
             override fun onAudioSessionIdChanged(audioSessionId: Int) {
@@ -94,15 +106,22 @@ class AetherPlaybackService : MediaLibraryService() {
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                // Invalidate cached URL on HTTP 403/410 and retry once or advance
+                consecutiveErrors++
                 val curId = exo.currentMediaItem?.mediaId
                 if (!curId.isNullOrBlank()) {
                     youtube.invalidateStream(curId)
                 }
-                if (exo.hasNextMediaItem()) {
+                val detail = youtube.lastResolveError
+                    ?: error.cause?.localizedMessage
+                    ?: error.localizedMessage
+                    ?: "Ошибка воспроизведения"
+                if (consecutiveErrors <= 2 && exo.hasNextMediaItem()) {
                     exo.seekToNextMediaItem()
                     exo.prepare()
                     exo.playWhenReady = true
+                } else {
+                    consecutiveErrors = 0
+                    _playbackError.value = "Трек не загрузился: $detail"
                 }
             }
         })
@@ -370,5 +389,12 @@ class AetherPlaybackService : MediaLibraryService() {
         const val NODE_QUEUE = "aether_queue"
         const val CMD_SET_EQ = "com.aether.music.CMD_SET_EQ"
         const val ARG_EQ_PRESET = "eq_preset"
+
+        private val _playbackError = MutableStateFlow<String?>(null)
+        val playbackError: StateFlow<String?> = _playbackError.asStateFlow()
+
+        fun clearPlaybackError() {
+            _playbackError.value = null
+        }
     }
 }

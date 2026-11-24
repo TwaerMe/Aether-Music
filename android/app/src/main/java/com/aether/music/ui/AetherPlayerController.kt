@@ -74,6 +74,13 @@ class AetherPlayerController(private val appContext: Context) {
     fun connect() {
         if (controller != null) return
         scope.launch {
+            AetherPlaybackService.playbackError.collect { err ->
+                if (!err.isNullOrBlank()) {
+                    _uiState.update { it.copy(errorMessage = err) }
+                }
+            }
+        }
+        scope.launch {
             try {
                 val token = SessionToken(
                     appContext,
@@ -332,6 +339,7 @@ class AetherPlayerController(private val appContext: Context) {
     }
 
     fun clearError() {
+        AetherPlaybackService.clearPlaybackError()
         _uiState.update { it.copy(errorMessage = null) }
     }
 }

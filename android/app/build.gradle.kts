@@ -15,8 +15,8 @@ android {
         applicationId = "com.aether.music"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.2.1"
+        versionCode = 3
+        versionName = "2.2.2"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -75,6 +75,7 @@ android {
     }
 
     compileOptions {
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -91,11 +92,15 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += "/META-INF/DEPENDENCIES"
+            excludes += "/META-INF/INDEX.LIST"
         }
     }
 }
 
 dependencies {
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.2")
+
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.activity:activity-compose:1.9.2")
@@ -107,11 +112,16 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 
-    // Media3 (ExoPlayer + MediaLibraryService for OriginOS 6 Atomic Player & Origin Island)
+    // Media3 (ExoPlayer + HLS/DASH + MediaLibraryService for OriginOS 6 Atomic Player & Origin Island)
     implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
+    implementation("androidx.media3:media3-exoplayer-dash:1.4.1")
     implementation("androidx.media3:media3-session:1.4.1")
     implementation("androidx.media3:media3-common:1.4.1")
     implementation("androidx.media3:media3-datasource-okhttp:1.4.1")
+
+    // Battle-tested YouTube stream extractor with JS signature & n-param deobfuscation
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.27.1")
 
     // Networking & Artwork
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

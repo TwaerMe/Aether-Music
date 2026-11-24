@@ -6,9 +6,16 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.schabi.newpipe.extractor.NewPipe
+import org.schabi.newpipe.extractor.ServiceList
+import org.schabi.newpipe.extractor.localization.ContentCountry
+import org.schabi.newpipe.extractor.localization.Localization
+import org.schabi.newpipe.extractor.stream.DeliveryMethod
+import org.schabi.newpipe.extractor.stream.StreamInfo
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class ResolvedStream(
     val url: String,
@@ -18,9 +25,10 @@ data class ResolvedStream(
 
 class YouTubeInnerTubeClient(
     val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(18, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
         .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 ) {
     private val streamCache = ConcurrentHashMap<String, ResolvedStream>()
@@ -28,6 +36,18 @@ class YouTubeInnerTubeClient(
 
     private val artistSuffixRegex = Regex("\\s*(-\\s*Topic|Official|VEVO|Music)$", RegexOption.IGNORE_CASE)
     private val expireRegex = Regex("[?&]expire=(\\d+)")
+    private val visitorDataRegex = Regex("\"(Cg[a-zA-Z0-9_%-]{10,})\"")
+
+    @Volatile
+    private var cachedVisitorData: String? = null
+
+    @Volatile
+    var lastResolveError: String? = null
+        private set
+
+    init {
+        ensureNewPipeInitialized(httpClient)
+    }
 
     private data class PlayerClientProfile(
         val name: String,
@@ -36,14 +56,14 @@ class YouTubeInnerTubeClient(
         val clientHeaderId: String,
         val endpoint: String = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
         val extraClientFields: Map<String, Any> = emptyMap(),
-        val embedUrl: String? = null,
+        val sendOrigin: Boolean = false,
     )
 
     private val playerProfiles = listOf(
         PlayerClientProfile(
             name = "ANDROID_VR",
-            version = "1.60.19",
-            userAgent = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+            version = "1.61.48",
+            userAgent = "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
             clientHeaderId = "28",
             extraClientFields = mapOf(
                 "deviceMake" to "Oculus",
@@ -55,34 +75,32 @@ class YouTubeInnerTubeClient(
         ),
         PlayerClientProfile(
             name = "IOS",
-            version = "19.45.4",
-            userAgent = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
+            version = "20.10.4",
+            userAgent = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
             clientHeaderId = "5",
             extraClientFields = mapOf(
                 "deviceMake" to "Apple",
                 "deviceModel" to "iPhone16,2",
                 "osName" to "iPhone",
-                "osVersion" to "18.1.0.22B83",
+                "osVersion" to "18.3.2.22D82",
             ),
         ),
         PlayerClientProfile(
-            name = "ANDROID_MUSIC",
-            version = "7.21.50",
-            userAgent = "com.google.android.apps.youtube.music/7.21.50 (Linux; U; Android 13) gzip",
-            clientHeaderId = "21",
-            endpoint = "https://music.youtube.com/youtubei/v1/player?prettyPrint=false",
+            name = "ANDROID",
+            version = "20.10.38",
+            userAgent = "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
+            clientHeaderId = "3",
             extraClientFields = mapOf(
-                "androidSdkVersion" to 33,
+                "androidSdkVersion" to 34,
                 "osName" to "Android",
-                "osVersion" to "13",
+                "osVersion" to "14",
             ),
         ),
         PlayerClientProfile(
-            name = "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-            version = "2.0",
+            name = "TVHTML5",
+            version = "7.20250312.16.00",
             userAgent = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
-            clientHeaderId = "85",
-            embedUrl = "https://www.youtube.com",
+            clientHeaderId = "7",
         ),
     )
 
@@ -95,39 +113,116 @@ class YouTubeInnerTubeClient(
         if (!forceRefresh) {
             val cached = streamCache[videoId]
             if (cached != null && cached.expiresAtMs > now + 120_000L) {
+                lastResolveError = null
                 return cached
             }
         }
 
+        val errors = mutableListOf<String>()
+
+        // 1. Primary: NewPipeExtractor v0.27.1 (handles JS signature + n-param deobfuscation & fresh clients)
+        try {
+            val extracted = resolveWithNewPipe(videoId)
+            if (extracted != null) {
+                streamCache[videoId] = extracted
+                lastResolveError = null
+                return extracted
+            }
+            errors += "NewPipe: нет аудиопотоков"
+        } catch (e: Exception) {
+            errors += "NewPipe: ${e.message ?: e.javaClass.simpleName}"
+        }
+
+        // 2. Fallback: Direct InnerTube API with live visitorData
+        val visitorData = fetchVisitorData()
         for (profile in playerProfiles) {
             try {
-                val resolved = requestPlayerStream(videoId, profile)
+                val resolved = requestPlayerStream(videoId, profile, visitorData)
                 if (resolved != null) {
                     streamCache[videoId] = resolved
+                    lastResolveError = null
                     return resolved
                 }
-            } catch (_: Exception) {
-                // Try next InnerTube client profile
+            } catch (e: Exception) {
+                errors += "${profile.name}: ${e.message ?: e.javaClass.simpleName}"
             }
         }
+
+        lastResolveError = errors.firstOrNull() ?: "Не удалось получить аудиопоток с YouTube"
         return null
     }
 
-    private fun requestPlayerStream(videoId: String, profile: PlayerClientProfile): ResolvedStream? {
+    private fun resolveWithNewPipe(videoId: String): ResolvedStream? {
+        ensureNewPipeInitialized(httpClient)
+        val watchUrl = "https://www.youtube.com/watch?v=$videoId"
+        val info = StreamInfo.getInfo(ServiceList.YouTube, watchUrl)
+
+        val audioStreams = info.audioStreams.orEmpty()
+            .filter { it.isUrl && !it.content.isNullOrBlank() }
+
+        val bestAudio = audioStreams.maxByOrNull { stream ->
+            var score = stream.averageBitrate.toDouble()
+            if (stream.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP) {
+                score += 10_000.0
+            }
+            val codec = stream.codec.orEmpty().lowercase()
+            if (codec.contains("mp4a")) score += 400.0
+            else if (codec.contains("opus")) score += 350.0
+            score
+        }
+
+        val url = bestAudio?.content?.takeIf { it.isNotBlank() }
+            ?: info.hlsUrl?.takeIf { it.isNotBlank() }
+            ?: return null
+
+        return ResolvedStream(
+            url = url,
+            userAgent = OkHttpNewPipeDownloader.DEFAULT_USER_AGENT,
+            expiresAtMs = parseExpiryMs(url),
+        )
+    }
+
+    private fun fetchVisitorData(): String? {
+        cachedVisitorData?.let { return it }
+        return try {
+            val req = Request.Builder()
+                .url("https://www.youtube.com/sw.js_data")
+                .header("User-Agent", OkHttpNewPipeDownloader.DEFAULT_USER_AGENT)
+                .get()
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                val body = resp.body?.string() ?: return null
+                val found = visitorDataRegex.find(body)?.groupValues?.getOrNull(1)
+                if (!found.isNullOrBlank()) {
+                    cachedVisitorData = found
+                }
+                found
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun requestPlayerStream(
+        videoId: String,
+        profile: PlayerClientProfile,
+        visitorData: String?,
+    ): ResolvedStream? {
         val clientJson = JSONObject().apply {
             put("clientName", profile.name)
             put("clientVersion", profile.version)
             put("hl", "ru")
             put("gl", "US")
+            if (!visitorData.isNullOrBlank()) {
+                put("visitorData", visitorData)
+            }
             for ((k, v) in profile.extraClientFields) {
                 put(k, v)
             }
         }
         val contextJson = JSONObject().apply {
             put("client", clientJson)
-            if (profile.embedUrl != null) {
-                put("thirdParty", JSONObject().put("embedUrl", profile.embedUrl))
-            }
         }
         val payload = JSONObject().apply {
             put("videoId", videoId)
@@ -136,16 +231,21 @@ class YouTubeInnerTubeClient(
             put("racyCheckOk", true)
         }
 
-        val req = Request.Builder()
+        val reqBuilder = Request.Builder()
             .url(profile.endpoint)
             .header("User-Agent", profile.userAgent)
             .header("X-YouTube-Client-Name", profile.clientHeaderId)
             .header("X-YouTube-Client-Version", profile.version)
-            .header("Origin", "https://www.youtube.com")
             .post(payload.toString().toRequestBody(jsonMediaType))
-            .build()
 
-        httpClient.newCall(req).execute().use { resp ->
+        if (!visitorData.isNullOrBlank()) {
+            reqBuilder.header("X-Goog-Visitor-Id", visitorData)
+        }
+        if (profile.sendOrigin) {
+            reqBuilder.header("Origin", "https://www.youtube.com")
+        }
+
+        httpClient.newCall(reqBuilder.build()).execute().use { resp ->
             if (!resp.isSuccessful) return null
             val bodyStr = resp.body?.string() ?: return null
             val root = JSONObject(bodyStr)
@@ -176,7 +276,7 @@ class YouTubeInnerTubeClient(
 
                 val bitrate = fmt.optDouble("averageBitrate", fmt.optDouble("bitrate", 0.0)) / 1000.0
                 val codecBonus = when {
-                    mime.contains("mp4a") -> 40.0 // Best hardware compatibility across Android/ExoPlayer
+                    mime.contains("mp4a") -> 40.0
                     mime.contains("opus") -> 35.0
                     else -> 10.0
                 }
@@ -222,14 +322,14 @@ class YouTubeInnerTubeClient(
     private fun searchYouTubeMusic(query: String, limit: Int): List<Track> {
         val payload = JSONObject().apply {
             put("query", query)
-            put("params", "EgWKAQIIAWoMEAMQBBAJEAoQBRAV") // Songs filter on YouTube Music
+            put("params", "EgWKAQIIAWoMEAMQBBAJEAoQBRAV")
             put(
                 "context",
                 JSONObject().put(
                     "client",
                     JSONObject().apply {
                         put("clientName", "WEB_REMIX")
-                        put("clientVersion", "1.20241106.01.00")
+                        put("clientVersion", "1.20250501.01.00")
                         put("hl", "ru")
                         put("gl", "US")
                     }
@@ -238,7 +338,7 @@ class YouTubeInnerTubeClient(
         }
         val req = Request.Builder()
             .url("https://music.youtube.com/youtubei/v1/search?prettyPrint=false")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
             .header("Origin", "https://music.youtube.com")
             .header("Referer", "https://music.youtube.com/")
             .post(payload.toString().toRequestBody(jsonMediaType))
@@ -262,7 +362,7 @@ class YouTubeInnerTubeClient(
                     "client",
                     JSONObject().apply {
                         put("clientName", "WEB")
-                        put("clientVersion", "2.20241107.01.00")
+                        put("clientVersion", "2.20250501.01.00")
                         put("hl", "ru")
                         put("gl", "US")
                     }
@@ -271,7 +371,7 @@ class YouTubeInnerTubeClient(
         }
         val req = Request.Builder()
             .url("https://www.youtube.com/youtubei/v1/search?prettyPrint=false")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
             .header("Origin", "https://www.youtube.com")
             .post(payload.toString().toRequestBody(jsonMediaType))
             .build()
@@ -296,7 +396,7 @@ class YouTubeInnerTubeClient(
                     "client",
                     JSONObject().apply {
                         put("clientName", "WEB_REMIX")
-                        put("clientVersion", "1.20241106.01.00")
+                        put("clientVersion", "1.20250501.01.00")
                         put("hl", "ru")
                         put("gl", "US")
                     }
@@ -305,7 +405,7 @@ class YouTubeInnerTubeClient(
         }
         val req = Request.Builder()
             .url("https://music.youtube.com/youtubei/v1/next?prettyPrint=false")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
             .header("Origin", "https://music.youtube.com")
             .header("Referer", "https://music.youtube.com/")
             .post(payload.toString().toRequestBody(jsonMediaType))
@@ -440,7 +540,6 @@ class YouTubeInnerTubeClient(
         val durationText = vr.optJSONObject("lengthText")?.optString("simpleText")
             ?: readRunsText(vr.optJSONObject("lengthText"))
         val durationSec = parseDurationText(durationText)
-        // Skip livestreams / shorts under 25s
         if (durationSec in 1L..24L) return null
         val thumb = pickThumbnailUrl(
             vr.optJSONObject("thumbnail")?.optJSONArray("thumbnails"),
@@ -540,6 +639,24 @@ class YouTubeInnerTubeClient(
             2 -> parts[0] * 60L + parts[1]
             3 -> parts[0] * 3600L + parts[1] * 60L + parts[2]
             else -> 0L
+        }
+    }
+
+    companion object {
+        private val newPipeInitialized = AtomicBoolean(false)
+
+        fun ensureNewPipeInitialized(client: OkHttpClient) {
+            if (newPipeInitialized.compareAndSet(false, true)) {
+                try {
+                    NewPipe.init(
+                        OkHttpNewPipeDownloader(client),
+                        Localization("ru", "RU"),
+                        ContentCountry("US"),
+                    )
+                } catch (_: Exception) {
+                    newPipeInitialized.set(false)
+                }
+            }
         }
     }
 }
